@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 
 from src.models.models import JobInfo
 from src.services.apify_service import apify_fallback_scrape, can_run_apify, is_apify_web_scrape_candidate
-from src.utils.bot_detection import is_content_usable
+from src.utils.bot_detection import BlockKind, is_content_usable
 from src.utils.browser_pool import PageFetchResult, fetch_page_stealth
 from src.utils.logger import get_logger
 
@@ -28,12 +28,22 @@ async def fetch_with_antibot(
     if not result.blocked.is_blocked and is_content_usable(result.text):
         return result
 
+    if result.blocked.kind == BlockKind.EMPTY and not result.links:
+        logger.info("Страница пуста без признаков защиты: %s", url[:60])
+
     apify_ok, apify_reason = can_run_apify()
     if not apify_ok:
-        logger.warning("Apify недоступен для fallback: %s", apify_reason)
+        if result.blocked.kind in {BlockKind.CAPTCHA, BlockKind.DENIED}:
+            logger.warning(
+                "%s требует прокси или cookies (%s). Apify недоступен: %s",
+                url[:50], result.blocked.reason, apify_reason,
+            )
         return result
 
-    logger.info("Fallback Apify для %s (причина: %s)", url[:50], result.blocked.reason)
+    logger.info(
+        "Fallback Apify для %s (%s: %s)",
+        url[:50], result.blocked.kind.value, result.blocked.reason,
+    )
 
     base = site_base_url or url
     apify_data = await apify_fallback_scrape(base, query, location=location)

@@ -9,12 +9,11 @@ class InputMode(str, Enum):
 
 
 class SearchStates(StatesGroup):
-    choosing_mode = State()
     waiting_preference = State()
     waiting_resume = State()
-    waiting_filters = State()
-    waiting_city = State()
+    setup = State()             # единый экран настройки поиска
+    waiting_region = State()
     waiting_salary = State()
     waiting_experience = State()
-    waiting_urls = State()
+    waiting_site_url = State()
     searching = State()

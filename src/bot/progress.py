@@ -1,4 +1,4 @@
-"""Форматирование прогресса поиска для Telegram."""
+"""Отображение прогресса поиска в Telegram."""
 
 from __future__ import annotations
 
@@ -7,19 +7,18 @@ from typing import Optional
 
 from src.utils.telegram_html import h
 
-
 PHASE_LABELS = {
-    "validating": "🔍 Проверка ссылок",
-    "start_site": "🌐 Новый сайт",
-    "apify": "🤖 Apify",
-    "apify_fallback": "🤖 Apify fallback",
-    "playwright": "🕵️ Stealth Playwright",
-    "scoring": "🎯 Оценка релевантности",
-    "done": "✅ Готово",
-    "cancelled": "⏹ Остановлено",
+    "validating": "Проверяю ссылки",
+    "start_site": "Открываю сайт",
+    "apify": "Ищу через Apify",
+    "apify_fallback": "Обхожу блокировку через Apify",
+    "playwright": "Собираю вакансии",
+    "filtering": "Проверяю регион и фильтры",
+    "scoring": "Оцениваю релевантность",
+    "done": "Готово",
+    "cancelled": "Останавливаюсь",
 }
 
-# LangGraph node names → UI phase
 NODE_PHASE_MAP = {
     "job_link_extractor": "playwright",
     "job_info_extractor": "playwright",
@@ -28,15 +27,15 @@ NODE_PHASE_MAP = {
     "apify": "apify",
     "apify_fallback": "apify_fallback",
     "playwright": "playwright",
+    "filtering": "filtering",
     "scoring": "scoring",
 }
 
 
-def render_bar(ratio: float, width: int = 16) -> str:
+def render_bar(ratio: float, width: int = 14) -> str:
     ratio = max(0.0, min(1.0, ratio))
     filled = round(width * ratio)
-    empty = width - filled
-    return f"{'█' * filled}{'░' * empty}"
+    return f"{'█' * filled}{'░' * (width - filled)}"
 
 
 @dataclass
@@ -48,12 +47,10 @@ class SearchProgressTracker:
     pages_visited: int = 0
     max_jobs_target: int = 5
     phase: str = "validating"
-    status_message: str = "Инициализация…"
-    current_url: str = ""
+    status_message: str = "Начинаю…"
     cancelled: bool = False
-    city: Optional[str] = None
-    salary_label: Optional[str] = None
-    experience_label: Optional[str] = None
+    region: Optional[str] = None
+    filters_line: Optional[str] = None
     step_count: int = 0
     max_steps: int = 40
 
@@ -62,7 +59,7 @@ class SearchProgressTracker:
             return 0.0
 
         site_fraction = 1.0 / self.total_sites
-        completed_sites = min(self.current_site_index, self.total_sites) * site_fraction
+        completed = min(self.current_site_index, self.total_sites) * site_fraction
 
         inner = 0.0
         per_site_jobs = max(1, self.max_jobs_target // max(self.total_sites, 1))
@@ -71,18 +68,15 @@ class SearchProgressTracker:
         elif self.max_steps > 0 and self.step_count > 0:
             inner = min(self.step_count / self.max_steps, 0.95) * site_fraction
 
-        if self.phase == "scoring":
-            return min(0.95, completed_sites + site_fraction * 0.9)
+        if self.phase in {"filtering", "scoring"}:
+            return min(0.95, completed + site_fraction * 0.9)
         if self.phase == "done":
             return 1.0
-
-        return min(0.98, completed_sites + inner)
+        return min(0.98, completed + inner)
 
     def percent(self) -> int:
         if self.phase == "done":
             return 100
-        if self.cancelled:
-            return max(1, int(self.site_progress() * 100))
         return max(5, min(99, int(self.site_progress() * 100)))
 
     def update_from_node(self, node: str, state: dict, site_name: str = "") -> None:
@@ -91,7 +85,6 @@ class SearchProgressTracker:
             self.phase = mapped
 
         self.status_message = state.get("status_message") or self.status_message
-        self.current_url = (state.get("current_page_url") or state.get("website") or "")[:80]
         self.step_count = state.get("step_count", self.step_count)
 
         pages = state.get("links_visited", set())
@@ -107,43 +100,29 @@ class SearchProgressTracker:
         self.step_count = 0
 
     def to_html(self) -> str:
-        pct = self.percent()
-        bar = render_bar(pct / 100.0)
+        percent = self.percent()
         phase = PHASE_LABELS.get(self.phase, self.phase)
 
         lines = [
-            "<b>🔍 Поиск вакансий</b>",
+            f"<b>🔍 Ищу вакансии</b> · {percent}%",
+            f"<code>{render_bar(percent / 100.0)}</code>",
             "",
-            f"<code>{bar}</code>  <b>{pct}%</b>",
-            "",
+            f"⚙️ {h(phase)}",
         ]
 
-        if self.total_sites > 1:
-            site_num = min(self.current_site_index + 1, self.total_sites)
-            lines.append(f"📊 Сайт <b>{site_num}/{self.total_sites}</b> · {h(self.current_site_name or '—')}")
-        elif self.current_site_name:
-            lines.append(f"📊 {h(self.current_site_name)}")
+        if self.current_site_name:
+            position = (
+                f" ({min(self.current_site_index + 1, self.total_sites)}/{self.total_sites})"
+                if self.total_sites > 1 else ""
+            )
+            lines.append(f"🌐 {h(self.current_site_name)}{position}")
 
-        lines.extend([
-            f"✅ Найдено: <b>{self.jobs_found}</b> вакансий",
-            f"📄 Страниц обработано: <b>{self.pages_visited}</b>",
-            f"⚙️ {h(phase)}: <i>{h(self.status_message[:100])}</i>",
-        ])
+        lines.append(f"✅ Собрано: <b>{self.jobs_found}</b> · страниц: {self.pages_visited}")
 
-        if self.current_url:
-            lines.append(f"🔗 {h(self.current_url)}")
-
-        filters = []
-        if self.city:
-            filters.append(f"📍 {h(self.city)}")
-        if self.experience_label:
-            filters.append(f"💼 {h(self.experience_label)}")
-        if self.salary_label:
-            filters.append(f"💰 {h(self.salary_label)}")
-        if filters:
-            lines.extend(["", " · ".join(filters)])
+        if self.filters_line:
+            lines += ["", f"<i>{h(self.filters_line)}</i>"]
 
         if self.cancelled:
-            lines.extend(["", "<i>⏹ Останавливаем… сохраняем найденное</i>"])
+            lines += ["", "<i>⏹ Останавливаюсь, сохраняю найденное…</i>"]
 
         return "\n".join(lines)

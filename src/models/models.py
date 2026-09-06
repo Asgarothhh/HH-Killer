@@ -47,6 +47,40 @@ class JobInfo(BaseModel):
         default_factory=list,
         description="Пробелы или несоответствия (из JobMatchResult)",
     )
+    ai_summary: Optional[str] = Field(
+        default=None,
+        description="Краткая сводка ИИ-агента по вакансии для пользователя",
+    )
+
+    def to_extraction(self) -> "JobExtraction":
+        """Приводит вакансию к схеме ответа JobExtraction."""
+        return JobExtraction(
+            job_title=self.title,
+            company_name=drop_placeholder(self.company) or "",
+            job_description=self.description,
+            application_method=self.source_url or self.application_info,
+            posted_date=self.posted_date.strftime("%d.%m.%Y") if self.posted_date else None,
+            location=drop_placeholder(self.job_location),
+            employment_type=drop_placeholder(self.employment_type),
+            salary_range=drop_placeholder(self.salary_range),
+        )
+
+
+# Заглушки, которые LLM ставит вместо отсутствующих данных
+_PLACEHOLDERS = {
+    "", "-", "—", "–", "n/a", "n\\a", "na", "none", "null", "nil", "unknown",
+    "не указано", "не указана", "не указан", "неизвестно", "нет данных",
+    "nie podano", "nie określono", "brak", "brak danych", "not specified",
+    "not provided", "not available", "no data",
+}
+
+
+def drop_placeholder(value: Optional[str]) -> Optional[str]:
+    """Возвращает None, если в поле стоит заглушка вместо реальных данных."""
+    text = str(value or "").strip()
+    if text.strip(".,;:!").lower() in _PLACEHOLDERS:
+        return None
+    return text or None
 
 
 def merge_sets(existing: Set[str], new: Set[str]) -> Set[str]:
@@ -139,6 +173,14 @@ class JobMatchResult(BaseModel):
     """Результат сопоставления вакансии с профилем."""
     match_score: float = Field(ge=0, le=100, description="Оценка релевантности 0–100")
     match_reason: str = Field(description="Краткое объяснение оценки")
+    summary: str = Field(
+        default="",
+        description="Сводка для кандидата: 1–2 предложения о вакансии и её соответствии",
+    )
+    region_confirmed: bool = Field(
+        default=True,
+        description="Подтверждает ли текст вакансии требуемый регион",
+    )
     key_matches: List[str] = Field(default_factory=list, description="Совпадающие навыки/опыт")
     gaps: List[str] = Field(default_factory=list, description="Пробелы или несоответствия")
 

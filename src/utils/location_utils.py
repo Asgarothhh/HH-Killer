@@ -1,133 +1,393 @@
-"""Нормализация городов и проверка локации вакансий."""
+"""Регионы: разбор пользовательского ввода и строгая проверка локации вакансий."""
 
 from __future__ import annotations
 
 import re
 import unicodedata
-from typing import List, Optional, Set
+from dataclasses import dataclass, field
+from enum import Enum
+from functools import lru_cache
+from typing import FrozenSet, Iterable, Optional, Tuple
+from urllib.parse import unquote, urlparse
 
-# Каноническое имя → варианты написания (нижний регистр)
-CITY_ALIASES: dict[str, tuple[str, ...]] = {
-    "warszawa": ("warszawa", "warsaw", "варшава", "warszawa, mazowieckie", "mazowieckie"),
-    "krakow": ("kraków", "krakow", "kraków", "краков", "cracow"),
-    "wroclaw": ("wrocław", "wroclaw", "вроцлав"),
-    "gdansk": ("gdańsk", "gdansk", "гданьск"),
-    "poznan": ("poznań", "poznan", "познань"),
-    "lodz": ("łódź", "lodz", "лодзь"),
-    "katowice": ("katowice", "катовице"),
-    "szczecin": ("szczecin", "щецин"),
-    "bydgoszcz": ("bydgoszcz", "бидгощ"),
-    "lublin": ("lublin", "люблин"),
-    "bialystok": ("białystok", "bialystok", "белосток"),
-}
 
-REMOTE_KEYWORDS = (
-    "remote", "zdalna", "zdalnie", "zdalny", "hybrid", "hybrydowa", "hybrydowo",
-    "home office", "work from home", "удалён", "удален", "удалёнка", "удаленка",
-    "anywhere", "worldwide", "fully remote", "praca zdalna",
+class RegionMatch(str, Enum):
+    """Результат сверки вакансии с запрошенным регионом."""
+    MATCH = "match"
+    MISMATCH = "mismatch"
+    UNKNOWN = "unknown"
+
+
+class WorkFormat(str, Enum):
+    ANY = "any"
+    ONSITE = "onsite"
+    HYBRID = "hybrid"
+    REMOTE = "remote"
+
+
+@dataclass(frozen=True)
+class RegionEntry:
+    key: str
+    display: str
+    country: str
+    kind: str  # "city" | "area" | "country"
+    aliases: Tuple[str, ...] = ()
+
+
+# Каталог регионов. display — написание для URL-параметров job-сайтов.
+REGION_CATALOG: Tuple[RegionEntry, ...] = (
+    # ── Польша: города ──────────────────────────────────────────────
+    RegionEntry("warszawa", "Warszawa", "PL", "city",
+                ("warsaw", "варшава", "warszawa", "warszawie", "waw")),
+    RegionEntry("krakow", "Kraków", "PL", "city",
+                ("krakow", "cracow", "краков", "krakowie")),
+    RegionEntry("wroclaw", "Wrocław", "PL", "city",
+                ("wroclaw", "breslau", "вроцлав", "wroclawiu")),
+    RegionEntry("gdansk", "Gdańsk", "PL", "city",
+                ("gdansk", "danzig", "гданьск", "trojmiasto", "tricity")),
+    RegionEntry("gdynia", "Gdynia", "PL", "city", ("gdynia", "гдыня")),
+    RegionEntry("sopot", "Sopot", "PL", "city", ("sopot", "сопот")),
+    RegionEntry("poznan", "Poznań", "PL", "city", ("poznan", "познань", "poznaniu")),
+    RegionEntry("lodz", "Łódź", "PL", "city", ("lodz", "лодзь", "lodzi")),
+    RegionEntry("katowice", "Katowice", "PL", "city",
+                ("katowice", "катовице", "katowicach", "gliwice", "sosnowiec")),
+    RegionEntry("szczecin", "Szczecin", "PL", "city", ("szczecin", "щецин")),
+    RegionEntry("bydgoszcz", "Bydgoszcz", "PL", "city", ("bydgoszcz", "бидгощ")),
+    RegionEntry("lublin", "Lublin", "PL", "city", ("lublin", "люблин", "lublinie")),
+    RegionEntry("bialystok", "Białystok", "PL", "city", ("bialystok", "белосток")),
+    RegionEntry("rzeszow", "Rzeszów", "PL", "city", ("rzeszow", "жешув")),
+    RegionEntry("torun", "Toruń", "PL", "city", ("torun", "торунь")),
+    RegionEntry("kielce", "Kielce", "PL", "city", ("kielce", "кельце")),
+    RegionEntry("olsztyn", "Olsztyn", "PL", "city", ("olsztyn", "ольштын")),
+    RegionEntry("opole", "Opole", "PL", "city", ("opole", "ополе")),
+    RegionEntry("zielona-gora", "Zielona Góra", "PL", "city",
+                ("zielona gora", "зелёна-гура")),
+
+    # ── Польша: воеводства ──────────────────────────────────────────
+    RegionEntry("mazowieckie", "Mazowieckie", "PL", "area",
+                ("mazowieckie", "mazowsze", "мазовецкое")),
+    RegionEntry("malopolskie", "Małopolskie", "PL", "area",
+                ("malopolskie", "малопольское")),
+    RegionEntry("dolnoslaskie", "Dolnośląskie", "PL", "area",
+                ("dolnoslaskie", "нижнесилезское")),
+    RegionEntry("pomorskie", "Pomorskie", "PL", "area", ("pomorskie", "поморское")),
+    RegionEntry("slaskie", "Śląskie", "PL", "area", ("slaskie", "силезское")),
+    RegionEntry("wielkopolskie", "Wielkopolskie", "PL", "area",
+                ("wielkopolskie", "великопольское")),
+
+    # ── Страны ──────────────────────────────────────────────────────
+    RegionEntry("polska", "Polska", "PL", "country",
+                ("polska", "poland", "польша", "polsce", "pl", "cala polska")),
+    RegionEntry("germany", "Deutschland", "DE", "country",
+                ("germany", "deutschland", "niemcy", "германия", "de")),
+    RegionEntry("czechia", "Česko", "CZ", "country",
+                ("czechia", "czechy", "czech republic", "чехия", "cesko")),
+    RegionEntry("ukraine", "Україна", "UA", "country",
+                ("ukraine", "ukraina", "украина", "україна", "ua")),
+    RegionEntry("lithuania", "Lietuva", "LT", "country",
+                ("lithuania", "litwa", "литва", "lietuva")),
+    RegionEntry("netherlands", "Nederland", "NL", "country",
+                ("netherlands", "holandia", "нидерланды", "holland", "nederland")),
+    RegionEntry("uk", "United Kingdom", "GB", "country",
+                ("united kingdom", "uk", "great britain", "wielka brytania",
+                 "великобритания", "england")),
+    RegionEntry("usa", "United States", "US", "country",
+                ("united states", "usa", "us", "сша", "stany zjednoczone")),
+    RegionEntry("russia", "Россия", "RU", "country",
+                ("russia", "россия", "рф", "rosja", "ru")),
+    RegionEntry("kazakhstan", "Қазақстан", "KZ", "country",
+                ("kazakhstan", "казахстан", "kazachstan", "kz")),
+
+    # ── Прочие крупные города ───────────────────────────────────────
+    RegionEntry("berlin", "Berlin", "DE", "city", ("berlin", "берлин")),
+    RegionEntry("munich", "München", "DE", "city", ("munich", "munchen", "мюнхен")),
+    RegionEntry("prague", "Praha", "CZ", "city", ("prague", "praha", "прага", "praga")),
+    RegionEntry("vilnius", "Vilnius", "LT", "city", ("vilnius", "вильнюс", "wilno")),
+    RegionEntry("kyiv", "Київ", "UA", "city", ("kyiv", "kiev", "киев", "київ")),
+    RegionEntry("lviv", "Львів", "UA", "city", ("lviv", "lwow", "львов", "львів")),
+    RegionEntry("moscow", "Москва", "RU", "city", ("moscow", "москва", "мск", "moskwa")),
+    RegionEntry("spb", "Санкт-Петербург", "RU", "city",
+                ("saint petersburg", "st petersburg", "санкт-петербург", "спб", "питер")),
+    RegionEntry("almaty", "Алматы", "KZ", "city", ("almaty", "алматы", "алма-ата")),
+    RegionEntry("astana", "Астана", "KZ", "city", ("astana", "астана", "нур-султан")),
+    RegionEntry("amsterdam", "Amsterdam", "NL", "city", ("amsterdam", "амстердам")),
+    RegionEntry("london", "London", "GB", "city", ("london", "лондон")),
 )
 
+REMOTE_KEYWORDS: Tuple[str, ...] = (
+    "remote", "fully remote", "remote first", "praca zdalna", "zdalna", "zdalnie",
+    "zdalny", "home office", "work from home", "wfh", "anywhere", "worldwide",
+    "удаленно", "удаленная", "удаленка", "дистанционно", "из дома",
+)
 
-def _normalize_text(text: str) -> str:
-    lowered = text.strip().lower()
-    normalized = unicodedata.normalize("NFKD", lowered)
-    return "".join(c for c in normalized if not unicodedata.combining(c))
+HYBRID_KEYWORDS: Tuple[str, ...] = (
+    "hybrid", "hybryda", "hybrydowa", "hybrydowo", "praca hybrydowa", "гибрид",
+    "гибридный", "частично удаленно",
+)
+
+ONSITE_KEYWORDS: Tuple[str, ...] = (
+    "on-site", "onsite", "stacjonarna", "stacjonarnie", "w biurze", "в офисе",
+    "office based",
+)
+
+# Слова-заполнители, которые нельзя использовать как признак региона
+_LOCATION_NOISE: FrozenSet[str] = frozenset({
+    "praca", "job", "jobs", "oferta", "oferty", "work", "vacancy", "вакансия",
+    "location", "lokalizacja", "miejsce", "city", "miasto", "город", "regionie",
+    "region", "area", "obszar", "wiele", "various", "multiple", "different",
+})
 
 
-def is_remote_query(city: str) -> bool:
-    norm = _normalize_text(city)
-    return any(kw in norm for kw in REMOTE_KEYWORDS)
+def _fold(text: str) -> str:
+    """Нижний регистр + удаление диакритики (ą→a, ł→l, ż→z)."""
+    lowered = (text or "").strip().lower().replace("ł", "l").replace("Ł", "l")
+    decomposed = unicodedata.normalize("NFKD", lowered)
+    stripped = "".join(c for c in decomposed if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", stripped)
 
 
-def resolve_canonical_city(city: str) -> Optional[str]:
-    """Возвращает каноническое имя города или None."""
-    parts = [_normalize_text(p.strip()) for p in city.split(",") if p.strip()]
-    for part in parts:
-        for canonical, variants in CITY_ALIASES.items():
-            if part == canonical or part in variants:
-                return canonical
+def fold_text(text: str) -> str:
+    """Публичная нормализация: нижний регистр без диакритики."""
+    return _fold(text)
 
-    norm = _normalize_text(city)
-    for canonical, variants in CITY_ALIASES.items():
-        if norm == canonical or norm in variants:
-            return canonical
-        if any(v in norm for v in variants):
-            return canonical
+
+def _word_pattern(tokens: Iterable[str]) -> Optional[re.Pattern]:
+    parts = sorted({re.escape(t) for t in tokens if t}, key=len, reverse=True)
+    if not parts:
+        return None
+    return re.compile(r"(?<!\w)(?:" + "|".join(parts) + r")(?!\w)", re.UNICODE)
+
+
+@lru_cache(maxsize=1)
+def _catalog_patterns() -> Tuple[Tuple[RegionEntry, re.Pattern], ...]:
+    result = []
+    for entry in REGION_CATALOG:
+        tokens = {_fold(entry.key.replace("-", " ")), _fold(entry.display)}
+        tokens.update(_fold(a) for a in entry.aliases)
+        # Односимвольные/двухсимвольные коды стран (pl, de) исключаем из
+        # текстового поиска — слишком много ложных срабатываний.
+        tokens = {t for t in tokens if len(t) >= 3}
+        pattern = _word_pattern(tokens)
+        if pattern:
+            result.append((entry, pattern))
+    return tuple(result)
+
+
+_REMOTE_PATTERN = _word_pattern(_fold(k) for k in REMOTE_KEYWORDS)
+_HYBRID_PATTERN = _word_pattern(_fold(k) for k in HYBRID_KEYWORDS)
+_ONSITE_PATTERN = _word_pattern(_fold(k) for k in ONSITE_KEYWORDS)
+
+
+@dataclass(frozen=True)
+class ResolvedRegion:
+    """Разобранный регион поиска."""
+    query: str
+    display: str
+    key: str
+    kind: str
+    country: Optional[str] = None
+    aliases: FrozenSet[str] = field(default_factory=frozenset)
+
+    @property
+    def is_known(self) -> bool:
+        return self.kind != "custom"
+
+    @property
+    def label(self) -> str:
+        return self.display or self.query
+
+    def matcher(self) -> Optional[re.Pattern]:
+        return _word_pattern(self.aliases)
+
+
+def is_remote_text(text: str) -> bool:
+    return bool(_REMOTE_PATTERN and _REMOTE_PATTERN.search(_fold(text)))
+
+
+def is_hybrid_text(text: str) -> bool:
+    return bool(_HYBRID_PATTERN and _HYBRID_PATTERN.search(_fold(text)))
+
+
+def is_onsite_text(text: str) -> bool:
+    return bool(_ONSITE_PATTERN and _ONSITE_PATTERN.search(_fold(text)))
+
+
+def find_region_entry(text: str) -> Optional[RegionEntry]:
+    """Находит регион из каталога по любому написанию."""
+    folded = _fold(text)
+    if not folded:
+        return None
+
+    for entry, pattern in _catalog_patterns():
+        if pattern.search(folded):
+            return entry
     return None
 
 
-def normalize_location_for_url(city: str) -> str:
-    """Имя города для параметров URL (польская/латиница)."""
-    if not city or is_remote_query(city):
-        return "Polska"
+def find_region_entries(text: str) -> Tuple[RegionEntry, ...]:
+    """Все регионы каталога, упомянутые в тексте."""
+    folded = _fold(text)
+    if not folded:
+        return ()
+    return tuple(entry for entry, pattern in _catalog_patterns() if pattern.search(folded))
 
-    primary = city.split(",")[0].strip()
-    canonical = resolve_canonical_city(primary) or resolve_canonical_city(city)
-    display_names = {
-        "warszawa": "Warszawa",
-        "krakow": "Kraków",
-        "wroclaw": "Wrocław",
-        "gdansk": "Gdańsk",
-        "poznan": "Poznań",
-        "lodz": "Łódź",
-        "katowice": "Katowice",
-        "szczecin": "Szczecin",
-        "bydgoszcz": "Bydgoszcz",
-        "lublin": "Lublin",
-        "bialystok": "Białystok",
+
+@lru_cache(maxsize=256)
+def resolve_region(text: str) -> Optional[ResolvedRegion]:
+    """
+    Разбирает пользовательский ввод региона.
+
+    Возвращает `None` для пустого ввода и для «remote» без указания места —
+    формат работы задаётся отдельным фильтром, а не регионом.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+
+    entry = find_region_entry(raw)
+
+    if entry is None and is_remote_text(raw):
+        return None
+
+    if entry is not None:
+        aliases = {_fold(entry.key.replace("-", " ")), _fold(entry.display)}
+        aliases.update(_fold(a) for a in entry.aliases)
+        aliases = {a for a in aliases if len(a) >= 3}
+        return ResolvedRegion(
+            query=raw,
+            display=entry.display,
+            key=entry.key,
+            kind=entry.kind,
+            country=entry.country,
+            aliases=frozenset(aliases),
+        )
+
+    # Неизвестный регион: используем ввод пользователя как есть.
+    primary = raw.split(",")[0].strip() or raw
+    tokens = {
+        _fold(primary),
+        _fold(raw),
+        *(t for t in re.split(r"[\s/;]+", _fold(primary)) if len(t) >= 4),
     }
-    if canonical and canonical in display_names:
-        return display_names[canonical]
-
-    return primary.strip() or city.strip()
-
-
-def city_variants(city: str) -> Set[str]:
-    """Все варианты написания города для поиска в тексте."""
-    norm = _normalize_text(city)
-    variants: Set[str] = {norm, city.strip().lower()}
-
-    canonical = resolve_canonical_city(city)
-    if canonical:
-        variants.add(canonical)
-        variants.update(_normalize_text(v) for v in CITY_ALIASES[canonical])
-
-    # Добавляем слова из ввода пользователя
-    for part in re.split(r"[,;/\s]+", norm):
-        if len(part) >= 3:
-            variants.add(part)
-
-    return {v for v in variants if v}
+    tokens = {t for t in tokens if len(t) >= 3 and t not in _LOCATION_NOISE}
+    return ResolvedRegion(
+        query=raw,
+        display=primary,
+        key=_fold(primary).replace(" ", "-"),
+        kind="custom",
+        country=None,
+        aliases=frozenset(tokens),
+    )
 
 
-def job_text_blob(job) -> str:
-    parts = [
-        getattr(job, "title", "") or "",
-        getattr(job, "description", "") or "",
-        getattr(job, "job_location", "") or "",
-        getattr(job, "company", "") or "",
-    ]
-    return _normalize_text(" ".join(parts))
+def region_display(text: Optional[str], default: str = "Polska") -> str:
+    """Написание региона для URL-параметров job-сайтов."""
+    region = resolve_region(text or "")
+    return region.display if region else default
 
 
-def job_matches_location(job, city: str) -> bool:
-    """Проверяет, что вакансия соответствует указанному городу."""
-    if not city:
-        return True
+def region_from_url(url: str) -> Optional[RegionEntry]:
+    """Определяет регион по URL поиска (?wp=Warszawa, /praca/warszawa/)."""
+    if not url:
+        return None
+    parsed = urlparse(url)
+    haystack = unquote(f"{parsed.path} {parsed.query}").replace("-", " ").replace("+", " ")
+    return find_region_entry(haystack)
 
-    if is_remote_query(city):
-        text = job_text_blob(job)
-        return any(_normalize_text(kw) in text for kw in REMOTE_KEYWORDS)
 
-    text = job_text_blob(job)
-    variants = city_variants(city)
+def _job_field(job, name: str) -> str:
+    return str(getattr(job, name, "") or "")
 
-    if any(v in text for v in variants):
-        return True
 
-    # Если локация не указана в вакансии — не отбрасываем жёстко (штраф в scorer)
-    location_field = getattr(job, "job_location", None) or ""
-    if not location_field.strip():
-        return True
+def job_location_text(job) -> str:
+    """Поля вакансии, в которых осмысленно искать локацию."""
+    return " ".join((
+        _job_field(job, "job_location"),
+        _job_field(job, "title"),
+        _job_field(job, "employment_type"),
+        _job_field(job, "description")[:1500],
+    ))
 
-    return False
+
+def job_work_format(job) -> WorkFormat:
+    """Формат работы, заявленный в вакансии."""
+    text = " ".join((
+        _job_field(job, "job_location"),
+        _job_field(job, "employment_type"),
+        _job_field(job, "title"),
+        _job_field(job, "description")[:2000],
+    ))
+    if is_remote_text(text) and not is_hybrid_text(text):
+        return WorkFormat.REMOTE
+    if is_hybrid_text(text):
+        return WorkFormat.HYBRID
+    if is_onsite_text(text):
+        return WorkFormat.ONSITE
+    return WorkFormat.ANY
+
+
+def match_job_region(
+    job,
+    region: Optional[ResolvedRegion],
+    *,
+    allow_remote: bool = False,
+) -> RegionMatch:
+    """
+    Сверяет вакансию с запрошенным регионом.
+
+    MATCH    — регион подтверждён (или вакансия удалённая, если это разрешено);
+    MISMATCH — вакансия явно из другого места;
+    UNKNOWN  — локацию определить не удалось.
+    """
+    if region is None:
+        return RegionMatch.MATCH
+
+    matcher = region.matcher()
+    if matcher is None:
+        return RegionMatch.UNKNOWN
+
+    def _covers(text: str) -> bool:
+        folded = _fold(text)
+        if not folded:
+            return False
+        if matcher.search(folded):
+            return True
+        # Для странового запроса подходит любой город этой страны.
+        if region.kind == "country" and region.country:
+            return any(
+                entry.country == region.country and pattern.search(folded)
+                for entry, pattern in _catalog_patterns()
+            )
+        return False
+
+    remote_ok = allow_remote and job_work_format(job) == WorkFormat.REMOTE
+    location_field = _job_field(job, "job_location").strip()
+
+    # Поле локации — главный источник истины.
+    if location_field:
+        if _covers(location_field):
+            return RegionMatch.MATCH
+        if remote_ok:
+            return RegionMatch.MATCH
+        folded_field = _fold(location_field)
+        if find_region_entries(folded_field):
+            return RegionMatch.MISMATCH
+        if folded_field in _LOCATION_NOISE or len(re.sub(r"\W", "", folded_field)) < 3:
+            return RegionMatch.UNKNOWN
+        return RegionMatch.MISMATCH
+
+    # Локация не заполнена — ищем регион в тексте вакансии.
+    if _covers(job_location_text(job)):
+        return RegionMatch.MATCH
+    if remote_ok:
+        return RegionMatch.MATCH
+
+    hint = region_from_url(_job_field(job, "source_url"))
+    if hint:
+        if hint.key == region.key or (
+            region.kind == "country" and hint.country == region.country
+        ):
+            return RegionMatch.MATCH
+        return RegionMatch.MISMATCH
+
+    return RegionMatch.UNKNOWN

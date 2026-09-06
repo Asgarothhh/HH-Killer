@@ -1,4 +1,5 @@
 import asyncio
+import re
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -6,7 +7,11 @@ from src.models.models import AgentState, JobInfo, JobExtraction, LinksCategoriz
 from src.services.anti_bot_service import fetch_with_antibot, filter_same_domain_links
 from src.utils.llm import create_chat_model
 from src.utils.logger import get_logger
-from src.utils.site_patterns import categorize_links_heuristic
+from src.utils.site_patterns import (
+    categorize_links_heuristic,
+    preserves_search_scope,
+    search_scope_tokens,
+)
 from src.utils.utils import is_job_detail_url, with_retry_and_rate_limit, parse_date_string, validate_and_filter_links
 
 logger = get_logger(__name__)
@@ -15,9 +20,15 @@ LLM_BATCH_SIZE = 30
 MAX_LINKS_FOR_LLM = 60
 
 
+_REGION_IN_CONTEXT = re.compile(
+    r"(?:Регион|Локация)\s*(?:\(строго\))?\s*:\s*(?:только\s+)?([^\n.]+)",
+    re.I,
+)
+
+
 def _location_from_preference(preference: str) -> str:
-    import re
-    match = re.search(r"Локация:\s*(?:только\s+)?([^\n.]+)", preference, re.I)
+    """Достаёт регион из контекста поиска, собранного build_matching_context."""
+    match = _REGION_IN_CONTEXT.search(preference or "")
     if match:
         return match.group(1).strip()
     return "Polska"
@@ -114,7 +125,6 @@ async def extract_job_details_modern(
         Извлеки сведения о вакансии из текста страницы job-портала.
 
         Контекст поиска пользователя: {user_preference}
-        (учитывай локацию и требования к опыту из контекста при извлечении location и описания)
 
         Текст страницы:
         {page_content[:12000]}
@@ -123,13 +133,20 @@ async def extract_job_details_modern(
         - job_title — точное название должности
         - company_name — работодатель
         - job_description — обязанности и требования (без дублирования локации и зарплаты)
-        - location — город/регион/Remote
-        - employment_type — полная занятость, частичная, контракт, удалёнка
-        - salary_range — зарплата, если указана
+        - location — город и страна ровно так, как указано в вакансии.
+          Не подставляй регион из контекста поиска и не догадывайся: если места
+          работы на странице нет, оставь поле пустым.
+        - employment_type — полная занятость, частичная, контракт, стажировка,
+          плюс формат работы (офис / гибрид / удалённо), если он указан
+        - salary_range — скопируй зарплату со страницы дословно, вместе с валютой
+          и периодом (например «23 233 – 23 917 zł brutto / mies.»). Не переводи
+          валюту на другой язык, не пересчитывай и не убирай пробелы внутри чисел:
+          «23 233» — это одно число, а не «23233» или «232 33»
         - application_method — ссылка или email для отклика
         - posted_date — дата публикации, если есть
 
-        Каждое поле заполняй отдельно согласно схеме JobExtraction. Не смешивай локацию и зарплату в job_description.
+        Каждое поле заполняй отдельно согласно схеме JobExtraction.
+        Не смешивай локацию и зарплату в job_description. Ничего не выдумывай.
         """
 
         result = await asyncio.to_thread(structured_llm.invoke, extraction_prompt)
@@ -206,11 +223,19 @@ async def job_link_extractor(state: AgentState) -> dict:
     updates = {"current_page_url": current_url}
 
     if page_data:
-        all_new = (
-            page_data.get("job_detail_links", [])
-            + page_data.get("job_listing_pages", [])
-            + page_data.get("navigation_links", [])[:3]
-        )
+        # Страницы выдачи берём только те, что сохраняют исходный запрос:
+        # иначе обход сползает на общий список вакансий сайта.
+        scope = search_scope_tokens(website or current_url)
+        listings = [
+            link for link in page_data.get("job_listing_pages", [])
+            if preserves_search_scope(link, scope)
+        ]
+        navigation = [
+            link for link in page_data.get("navigation_links", [])
+            if preserves_search_scope(link, scope)
+        ][:3]
+
+        all_new = page_data.get("job_detail_links", []) + listings + navigation
 
         base_domain = urlparse(website or current_url).hostname
         validated = validate_and_filter_links(
