@@ -7,7 +7,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
-from typing import FrozenSet, Iterable, Optional, Tuple
+from typing import FrozenSet, Iterable, Optional, Sequence, Tuple
 from urllib.parse import unquote, urlparse
 
 
@@ -97,6 +97,8 @@ REGION_CATALOG: Tuple[RegionEntry, ...] = (
                 ("russia", "россия", "рф", "rosja", "ru")),
     RegionEntry("kazakhstan", "Қазақстан", "KZ", "country",
                 ("kazakhstan", "казахстан", "kazachstan", "kz")),
+    RegionEntry("belarus", "Беларусь", "BY", "country",
+                ("belarus", "беларусь", "белоруссия", "bialorus", "by")),
 
     # ── Прочие крупные города ───────────────────────────────────────
     RegionEntry("berlin", "Berlin", "DE", "city", ("berlin", "берлин")),
@@ -105,6 +107,13 @@ REGION_CATALOG: Tuple[RegionEntry, ...] = (
     RegionEntry("vilnius", "Vilnius", "LT", "city", ("vilnius", "вильнюс", "wilno")),
     RegionEntry("kyiv", "Київ", "UA", "city", ("kyiv", "kiev", "киев", "київ")),
     RegionEntry("lviv", "Львів", "UA", "city", ("lviv", "lwow", "львов", "львів")),
+    RegionEntry("minsk", "Минск", "BY", "city", ("minsk", "минск", "miensk")),
+    RegionEntry("brest", "Брест", "BY", "city", ("brest", "брест", "brzesc", "brześć")),
+    RegionEntry("gomel", "Гомель", "BY", "city", ("gomel", "homel", "гомель")),
+    RegionEntry("grodno", "Гродно", "BY", "city", ("grodno", "hrodna", "гродно")),
+    RegionEntry("vitebsk", "Витебск", "BY", "city", ("vitebsk", "витебск")),
+    RegionEntry("mogilev", "Могилёв", "BY", "city",
+                ("mogilev", "mogilyov", "могилев", "могилёв")),
     RegionEntry("moscow", "Москва", "RU", "city", ("moscow", "москва", "мск", "moskwa")),
     RegionEntry("spb", "Санкт-Петербург", "RU", "city",
                 ("saint petersburg", "st petersburg", "санкт-петербург", "спб", "питер")),
@@ -136,6 +145,15 @@ _LOCATION_NOISE: FrozenSet[str] = frozenset({
     "location", "lokalizacja", "miejsce", "city", "miasto", "город", "regionie",
     "region", "area", "obszar", "wiele", "various", "multiple", "different",
 })
+
+# Сколько городов можно выбрать одновременно
+MAX_REGIONS = 5
+
+# «Брест, Минск и Москва» / «Brest / Minsk / Moscow»
+_REGION_SPLIT = re.compile(
+    r"\s*(?:,|;|/|\||\n|\+| и | and | или | or )\s*",
+    re.I,
+)
 
 
 def _fold(text: str) -> str:
@@ -391,3 +409,112 @@ def match_job_region(
         return RegionMatch.MISMATCH
 
     return RegionMatch.UNKNOWN
+
+
+def match_job_regions(
+    job,
+    regions: Sequence[ResolvedRegion],
+    *,
+    allow_remote: bool = False,
+) -> RegionMatch:
+    """
+    Вакансия подходит, если совпал хотя бы один выбранный регион.
+
+    MATCH    — есть совпадение (или удалёнка, если разрешена);
+    MISMATCH — ни один регион не подошёл, и локация определена;
+    UNKNOWN  — локацию подтвердить не удалось.
+    """
+    if not regions:
+        return RegionMatch.MATCH
+
+    verdicts = [
+        match_job_region(job, region, allow_remote=allow_remote)
+        for region in regions
+    ]
+    if any(verdict == RegionMatch.MATCH for verdict in verdicts):
+        return RegionMatch.MATCH
+    if all(verdict == RegionMatch.MISMATCH for verdict in verdicts):
+        return RegionMatch.MISMATCH
+    return RegionMatch.UNKNOWN
+
+
+def region_identity(text: str) -> str:
+    """Ключ для сравнения двух написаний одного города."""
+    resolved = resolve_region(text)
+    if resolved:
+        return resolved.key
+    return _fold(text)
+
+
+def canonicalize_region(text: str) -> str:
+    """Каноническое имя региона для URL и кнопок."""
+    resolved = resolve_region(text)
+    return resolved.display if resolved else (text or "").strip()
+
+
+def parse_region_list(text: str, *, limit: int = MAX_REGIONS) -> Tuple[str, ...]:
+    """
+    Разбирает один или несколько регионов из свободного ввода.
+
+    «Брест, Минск и Москва», «Brest / Minsk», «Warszawa».
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return ()
+
+    parts = [part.strip() for part in _REGION_SPLIT.split(raw) if part and part.strip()]
+    if len(parts) <= 1:
+        entries = find_region_entries(raw)
+        if len(entries) >= 2:
+            parts = [entry.display for entry in entries]
+        elif not parts:
+            parts = [raw]
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        resolved = resolve_region(part)
+        if resolved is None:
+            continue
+        if resolved.key in seen:
+            continue
+        seen.add(resolved.key)
+        result.append(resolved.display)
+        if len(result) >= limit:
+            break
+    return tuple(result)
+
+
+def merge_regions(*groups: Iterable[str], limit: int = MAX_REGIONS) -> Tuple[str, ...]:
+    """Склеивает списки регионов без дублей (Минск и Minsk — один город)."""
+    result: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for item in group:
+            for name in parse_region_list(item, limit=limit):
+                key = region_identity(name)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                result.append(canonicalize_region(name))
+                if len(result) >= limit:
+                    return tuple(result)
+    return tuple(result)
+
+
+def toggle_region(
+    current: Iterable[str],
+    candidate: str,
+    *,
+    limit: int = MAX_REGIONS,
+) -> Tuple[str, ...]:
+    """Добавляет город или убирает его, если он уже выбран."""
+    selected = merge_regions(current, limit=limit)
+    key = region_identity(candidate)
+    if not key:
+        return selected
+    if any(region_identity(item) == key for item in selected):
+        return tuple(item for item in selected if region_identity(item) != key)
+    if len(selected) >= limit:
+        return selected
+    return merge_regions(selected, (candidate,), limit=limit)

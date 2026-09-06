@@ -7,9 +7,19 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
-from src.models.models import JobInfo, ResumeProfile
-from src.services.search_query import SearchFilters, detect_employment_type
-from src.utils.location_utils import RegionMatch, WorkFormat, job_work_format, match_job_region
+from src.models.models import JobInfo, ResumeProfile, drop_placeholder
+from src.services.search_query import (
+    EMPLOYMENT_BY_KEY,
+    WORK_FORMAT_LABELS,
+    SearchFilters,
+    detect_employment_type,
+)
+from src.utils.location_utils import (
+    RegionMatch,
+    WorkFormat,
+    job_work_format,
+    match_job_regions,
+)
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -60,6 +70,36 @@ _TO_PLN: Dict[str, float] = {
 _SALARY_TOLERANCE = 0.15
 
 
+DROP_REASON_LABELS: Dict[str, str] = {
+    "region": "другой регион",
+    "region_unknown": "регион в вакансии не указан",
+    "work_format": "другой формат работы",
+    "employment": "другой тип занятости",
+    "experience": "не подходит по опыту",
+    "salary": "зарплата не совпадает с фильтром",
+    "freshness": "вакансия старше выбранного срока",
+    "relevance": "слабое совпадение с запросом",
+}
+
+
+@dataclass
+class DroppedJob:
+    """Вакансия, не прошедшая фильтр, с человекочитаемой причиной."""
+    job: JobInfo
+    reason: str
+    detail: str = ""
+
+    @property
+    def title(self) -> str:
+        return DROP_REASON_LABELS.get(self.reason, self.reason)
+
+    @property
+    def explanation(self) -> str:
+        if self.detail:
+            return f"{self.title} — {self.detail}"
+        return self.title
+
+
 @dataclass
 class FilterReport:
     """Сколько вакансий отброшено и почему — для честного ответа пользователю."""
@@ -75,27 +115,27 @@ class FilterReport:
         return sum(self.dropped.values())
 
     def summary(self) -> str:
-        labels = {
-            "region": "другой регион",
-            "region_unknown": "регион не указан",
-            "work_format": "не тот формат работы",
-            "employment": "не тот тип занятости",
-            "experience": "не подходит опыт",
-            "salary": "зарплата ниже фильтра",
-            "freshness": "устаревшие",
-        }
         parts = [
-            f"{labels.get(reason, reason)}: {count}"
+            f"{DROP_REASON_LABELS.get(reason, reason)}: {count}"
             for reason, count in sorted(self.dropped.items(), key=lambda kv: -kv[1])
             if count
         ]
         return ", ".join(parts)
+
+    def reason_lines(self) -> List[str]:
+        """Строки для пользователя: «3 — другой регион»."""
+        return [
+            f"{count} — {DROP_REASON_LABELS.get(reason, reason)}"
+            for reason, count in sorted(self.dropped.items(), key=lambda kv: -kv[1])
+            if count
+        ]
 
 
 @dataclass
 class FilterOutcome:
     jobs: List[JobInfo]
     report: FilterReport
+    dropped: List[DroppedJob] = field(default_factory=list)
 
 
 def parse_job_required_experience(text: str) -> Tuple[Optional[float], Optional[float]]:
@@ -268,6 +308,62 @@ def job_matches_salary(job: JobInfo, filters: SearchFilters | None) -> bool:
     return True
 
 
+def explain_drop(
+    reason: str,
+    job: JobInfo,
+    filters: SearchFilters | None = None,
+) -> str:
+    """Коротко, почему именно эта вакансия не прошла фильтр."""
+    if reason == "region":
+        found = drop_placeholder(job.job_location) or "другое место"
+        wanted = filters.region_label if filters else "заданный регион"
+        return f"в вакансии «{found}», искали {wanted}"
+    if reason == "region_unknown":
+        wanted = filters.region_label if filters else "заданный регион"
+        return f"город не указан, а поиск строго по {wanted}"
+    if reason == "work_format":
+        actual = WORK_FORMAT_LABELS.get(job_work_format(job).value, "не указан")
+        wanted = (filters.format_label if filters else None) or "заданный формат"
+        return f"в вакансии: {actual}; фильтр: {wanted}"
+    if reason == "employment":
+        haystack = " ".join(filter(None, (
+            job.employment_type or "",
+            job.title or "",
+            (job.description or "")[:1200],
+        )))
+        detected = detect_employment_type(haystack)
+        actual = EMPLOYMENT_BY_KEY[detected].label if detected in EMPLOYMENT_BY_KEY else (
+            drop_placeholder(job.employment_type) or "другой тип"
+        )
+        wanted = (filters.employment_label if filters else None) or "выбранный тип"
+        return f"в вакансии: {actual}; фильтр: {wanted}"
+    if reason == "experience":
+        text = f"{job.title} {job.description}"
+        req_min, req_max = parse_job_required_experience(text)
+        if req_min is not None and req_max is not None and req_min != req_max:
+            required = f"{req_min:g}–{req_max:g} лет"
+        elif req_min is not None:
+            required = f"от {req_min:g} лет"
+        else:
+            required = "опыт выше фильтра"
+        yours = filters.experience_label if filters else None
+        return f"вакансия требует {required}" + (f"; у вас {yours}" if yours else "")
+    if reason == "salary":
+        found = drop_placeholder(job.salary_range) or "сумма ниже фильтра"
+        wanted = (filters.salary_label if filters else None) or "заданный диапазон"
+        return f"в вакансии: {found}; фильтр: {wanted}"
+    if reason == "freshness":
+        posted = job.posted_date.strftime("%d.%m.%Y") if job.posted_date else "дата старше фильтра"
+        wanted = (filters.freshness_label if filters else None) or "выбранный срок"
+        return f"опубликована {posted}; фильтр: {wanted}"
+    if reason == "relevance":
+        score = job.match_score
+        if score is not None:
+            return f"оценка {score:.0f} из 100 — ниже порога показа"
+        return "слабо совпадает с запросом"
+    return DROP_REASON_LABELS.get(reason, reason)
+
+
 def job_matches_freshness(job: JobInfo, filters: SearchFilters | None) -> bool:
     """Свежесть: отбрасываем только вакансии с известной устаревшей датой."""
     if not filters or not filters.posted_within_days or job.posted_date is None:
@@ -342,41 +438,52 @@ def apply_search_filters(
     if not jobs:
         return FilterOutcome([], report)
 
-    region = filters.resolved_region if filters else None
+    region = filters.resolved_regions if filters else ()
     allow_remote = bool(filters and filters.allow_remote)
     kept: List[JobInfo] = []
+    rejected: List[DroppedJob] = []
+
+    def reject(job: JobInfo, reason: str) -> None:
+        report.drop(reason)
+        rejected.append(DroppedJob(
+            job=job,
+            reason=reason,
+            detail=explain_drop(reason, job, filters),
+        ))
 
     for job in jobs:
         sanitize_job_fields(job)
 
-        if region is not None:
-            verdict = match_job_region(job, region, allow_remote=allow_remote)
+        if region:
+            verdict = match_job_regions(job, region, allow_remote=allow_remote)
             if verdict == RegionMatch.MISMATCH:
-                report.drop("region")
+                reject(job, "region")
                 logger.debug(
                     "Регион не совпал (%s ≠ %s): %s",
-                    job.job_location or "—", region.label, job.title[:60],
+                    job.job_location or "—",
+                    filters.region_label if filters else "—",
+                    job.title[:60],
                 )
                 continue
             if verdict == RegionMatch.UNKNOWN and strict_region:
-                report.drop("region_unknown")
+                reject(job, "region_unknown")
                 logger.debug("Регион не подтверждён: %s", job.title[:60])
                 continue
 
         if not job_matches_work_format(job, filters):
-            report.drop("work_format")
+            reject(job, "work_format")
             continue
         if not job_matches_employment(job, filters):
-            report.drop("employment")
+            reject(job, "employment")
             continue
         if not job_matches_experience(job, filters, profile):
-            report.drop("experience")
+            reject(job, "experience")
             continue
         if not job_matches_salary(job, filters):
-            report.drop("salary")
+            reject(job, "salary")
             continue
         if not job_matches_freshness(job, filters):
-            report.drop("freshness")
+            reject(job, "freshness")
             continue
 
         kept.append(job)
@@ -387,4 +494,4 @@ def apply_search_filters(
             "Фильтры: %d → %d вакансий (%s)",
             report.total, report.kept, report.summary(),
         )
-    return FilterOutcome(kept, report)
+    return FilterOutcome(kept, report, rejected)

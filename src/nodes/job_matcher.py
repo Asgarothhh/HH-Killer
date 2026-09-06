@@ -7,7 +7,7 @@ from src.models.models import AgentState, JobInfo, JobMatchResult, ResumeProfile
 from src.services.job_filters import parse_job_required_experience
 from src.services.search_query import SearchFilters
 from src.utils.llm import create_chat_model
-from src.utils.location_utils import RegionMatch, match_job_region
+from src.utils.location_utils import RegionMatch, match_job_regions
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -20,7 +20,7 @@ def _filters_context(filters: SearchFilters | None) -> str:
     if not filters:
         return ""
 
-    parts = [f"- Регион (обязателен): {filters.region_label}"]
+    parts = [f"- Регион (обязателен, любой из): {filters.region_label}"]
     if filters.format_label:
         parts.append(f"- Формат работы: {filters.format_label}")
     if filters.employment_label:
@@ -96,8 +96,8 @@ async def _score_job(
     - Описание: {(job.description or "")[:2500]}
 
     Правила оценки:
-    1. Регион «{region_label}» обязателен. Если вакансия в другом городе/стране —
-       score < 20 и region_confirmed = false.
+    1. Регион «{region_label}» обязателен: вакансия должна быть хотя бы в одном
+       из этих мест. Если она в другом городе/стране — score < 20 и region_confirmed = false.
     2. Требуемый опыт значительно выше опыта кандидата — score < 40.
     3. Полное несоответствие должности или уровня — score < 20.
     4. Совпадение должности и навыков — главный фактор высокого score.
@@ -107,7 +107,7 @@ async def _score_job(
     о том, что за вакансия и почему она подходит или чем рискованна.
     Пиши по существу, без вводных фраз и без повторения названия компании.
 
-    region_confirmed — подтверждает ли текст вакансии регион «{region_label}».
+    region_confirmed — подтверждает ли текст вакансии хотя бы один регион из «{region_label}».
     key_matches — конкретные совпадения; gaps — конкретные несоответствия.
     """
 
@@ -118,11 +118,11 @@ async def _score_job(
         return job.model_copy(update={"match_score": 0.0, "match_reason": "Оценка недоступна"})
 
     score = result.match_score
-    region = filters.resolved_region if filters else None
+    regions = filters.resolved_regions if filters else ()
     allow_remote = bool(filters and filters.allow_remote)
 
-    if region is not None:
-        verdict = match_job_region(job, region, allow_remote=allow_remote)
+    if regions:
+        verdict = match_job_regions(job, regions, allow_remote=allow_remote)
         if verdict != RegionMatch.MATCH or not result.region_confirmed:
             score = min(score, 15.0)
 

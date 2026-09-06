@@ -7,7 +7,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from src.bot.states import InputMode
 from src.services.search_query import EMPLOYMENT_TYPES, SearchFilters
-from src.utils.location_utils import WorkFormat
+from src.utils.location_utils import WorkFormat, region_identity
 from src.utils.site_patterns import PRESET_LABELS, SITE_PRESETS, get_site_config
 
 # ── Пресеты подэкранов ─────────────────────────────────────────────────
@@ -20,7 +20,13 @@ REGION_PRESETS: Tuple[Tuple[str, str], ...] = (
     ("Poznań", "Poznań"),
     ("Łódź", "Łódź"),
     ("Katowice", "Katowice"),
+    ("Минск", "Минск"),
+    ("Брест", "Брест"),
+    ("Москва", "Москва"),
+    ("Санкт-Петербург", "Санкт-Петербург"),
     ("Вся Польша", "Polska"),
+    ("Беларусь", "Беларусь"),
+    ("Россия", "Россия"),
 )
 
 SALARY_PRESETS: Tuple[Tuple[str, int], ...] = (
@@ -89,10 +95,10 @@ def help_kb() -> InlineKeyboardMarkup:
 
 def setup_kb(filters: SearchFilters, sites_count: int, ready: bool) -> InlineKeyboardMarkup:
     """Единый экран: каждый параметр — одна кнопка со текущим значением."""
-    region = filters.region_label if filters.region else "не задан"
+    region = _region_button_label(filters)
     rows: List[List[InlineKeyboardButton]] = [
         [
-            InlineKeyboardButton(text=f"📍 Регион: {region}", callback_data="set:region"),
+            InlineKeyboardButton(text=f"📍 {region}", callback_data="set:region"),
         ],
         [
             InlineKeyboardButton(
@@ -127,7 +133,7 @@ def setup_kb(filters: SearchFilters, sites_count: int, ready: bool) -> InlineKey
 
     if ready:
         rows.append([InlineKeyboardButton(text="🚀 Начать поиск", callback_data="search:start")])
-    elif not filters.region:
+    elif not filters.has_region:
         rows.append([InlineKeyboardButton(text="📍 Сначала укажите регион", callback_data="set:region")])
     else:
         rows.append([InlineKeyboardButton(text="🌐 Выберите хотя бы один сайт", callback_data="set:sites")])
@@ -137,6 +143,18 @@ def setup_kb(filters: SearchFilters, sites_count: int, ready: bool) -> InlineKey
         InlineKeyboardButton(text="🏠 Меню", callback_data="menu:main"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _region_button_label(filters: SearchFilters) -> str:
+    names = filters.region_values
+    if not names:
+        return "Регион: не задан"
+    if len(names) == 1:
+        return f"Регион: {names[0]}"
+    joined = ", ".join(names)
+    if len(joined) > 28:
+        return f"Регионы ({len(names)}): {names[0]}…"
+    return f"Регионы: {joined}"
 
 
 def _short_experience(filters: SearchFilters) -> Optional[str]:
@@ -149,11 +167,18 @@ def _short_experience(filters: SearchFilters) -> Optional[str]:
 
 # ── Подэкраны ──────────────────────────────────────────────────────────
 
-def region_kb(resume_region: Optional[str] = None) -> InlineKeyboardMarkup:
-    buttons = [
-        InlineKeyboardButton(text=label, callback_data=f"region:{value}")
-        for label, value in REGION_PRESETS
-    ]
+def region_kb(
+    selected: Iterable[str] = (),
+    resume_region: Optional[str] = None,
+) -> InlineKeyboardMarkup:
+    chosen_keys = {region_identity(name) for name in selected if name}
+    buttons = []
+    for label, value in REGION_PRESETS:
+        mark = "✅ " if region_identity(value) in chosen_keys else ""
+        buttons.append(InlineKeyboardButton(
+            text=f"{mark}{label}",
+            callback_data=f"region:{value}",
+        ))
     rows = _rows(buttons, per_row=2)
 
     if resume_region:
@@ -162,7 +187,12 @@ def region_kb(resume_region: Optional[str] = None) -> InlineKeyboardMarkup:
             callback_data="region:__resume__",
         )])
 
-    rows.append([InlineKeyboardButton(text="✍️ Другой город или страна", callback_data="region:__custom__")])
+    rows.append([InlineKeyboardButton(
+        text="✍️ Другой город (можно несколько)",
+        callback_data="region:__custom__",
+    )])
+    if chosen_keys:
+        rows.append([InlineKeyboardButton(text="🚫 Очистить", callback_data="region:__clear__")])
     rows.append(_back_row())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -271,11 +301,16 @@ def search_cancel_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def after_search_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎛 Изменить фильтры", callback_data="setup:show")],
-        [InlineKeyboardButton(text="🔄 Новый поиск", callback_data="menu:main")],
-    ])
+def after_search_kb(dropped_count: int = 0) -> InlineKeyboardMarkup:
+    rows = []
+    if dropped_count:
+        rows.append([InlineKeyboardButton(
+            text=f"👁 Показать отброшенные ({dropped_count})",
+            callback_data="search:dropped",
+        )])
+    rows.append([InlineKeyboardButton(text="🎛 Изменить фильтры", callback_data="setup:show")])
+    rows.append([InlineKeyboardButton(text="🔄 Новый поиск", callback_data="menu:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def site_label(url: str) -> str:

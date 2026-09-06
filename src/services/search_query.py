@@ -8,8 +8,10 @@ from typing import Dict, List, Optional, Tuple
 
 from src.models.models import ResumeProfile, parse_experience_years
 from src.utils.location_utils import (
+    MAX_REGIONS,
     ResolvedRegion,
     WorkFormat,
+    merge_regions,
     region_display,
     resolve_region,
 )
@@ -85,9 +87,10 @@ FRESHNESS_LABELS: Dict[int, str] = {
 
 @dataclass
 class SearchFilters:
-    """Фильтры поиска. Регион обязателен — поиск идёт строго по нему."""
+    """Фильтры поиска. Регион обязателен — можно указать несколько городов."""
 
-    region: Optional[str] = None
+    regions: Tuple[str, ...] = ()
+    region: Optional[str] = None  # одно значение — совместимость со старым API
     work_format: str = WorkFormat.ANY.value
     employment_types: Tuple[str, ...] = ()
     salary_min: Optional[int] = None
@@ -100,23 +103,53 @@ class SearchFilters:
 
     # ── Регион ──────────────────────────────────────────────────────
     @property
+    def region_values(self) -> Tuple[str, ...]:
+        extras = (self.region,) if self.region else ()
+        return merge_regions(self.regions, extras, limit=MAX_REGIONS)
+
+    @property
     def city(self) -> Optional[str]:
         """Совместимость с прежним названием поля."""
-        return self.region
+        values = self.region_values
+        return values[0] if values else None
+
+    @property
+    def resolved_regions(self) -> Tuple[ResolvedRegion, ...]:
+        result: List[ResolvedRegion] = []
+        seen: set[str] = set()
+        for name in self.region_values:
+            resolved = resolve_region(name)
+            if resolved is None or resolved.key in seen:
+                continue
+            seen.add(resolved.key)
+            result.append(resolved)
+        return tuple(result)
 
     @property
     def resolved_region(self) -> Optional[ResolvedRegion]:
-        return resolve_region(self.region or "")
+        regions = self.resolved_regions
+        return regions[0] if regions else None
+
+    @property
+    def has_region(self) -> bool:
+        return bool(self.region_values)
 
     @property
     def region_label(self) -> str:
-        region = self.resolved_region
-        if region:
-            return region.label
-        return self.region or DEFAULT_REGION
+        labels = [item.label for item in self.resolved_regions]
+        if labels:
+            return ", ".join(labels)
+        return self.city or DEFAULT_REGION
 
     def location_for_url(self) -> str:
-        return region_display(self.region, default=DEFAULT_REGION)
+        values = self.region_values
+        return region_display(values[0] if values else None, default=DEFAULT_REGION)
+
+    def locations_for_url(self) -> Tuple[str, ...]:
+        values = self.region_values
+        if not values:
+            return (DEFAULT_REGION,)
+        return tuple(region_display(name, default=name) for name in values)
 
     def location_for_apify(self) -> str:
         return self.location_for_url()
@@ -192,7 +225,7 @@ class SearchFilters:
 
     # ── Сводки ──────────────────────────────────────────────────────
     def active_labels(self) -> List[str]:
-        labels = [f"📍 {self.region_label}"]
+        labels = [f"📍 {self.region_label}"] if self.has_region else []
         for emoji, value in (
             ("🏢", self.format_label),
             ("💼", self.employment_label),
@@ -349,7 +382,7 @@ def build_matching_context(preference: str, filters: SearchFilters | None = None
     if not filters:
         return parts[0]
 
-    parts.append(f"Регион (строго): {filters.region_label}")
+    parts.append(f"Регион (строго, любой из): {filters.region_label}")
 
     if filters.format_label:
         parts.append(f"Формат работы: {filters.format_label}")

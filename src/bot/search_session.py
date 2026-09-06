@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from src.models.models import JobInfo
+from src.services.job_filters import DroppedJob
 
 
 @dataclass
@@ -21,11 +22,14 @@ class SearchSession:
 
 
 _sessions: Dict[int, SearchSession] = {}
+_last_dropped: Dict[int, List[DroppedJob]] = {}
+_dropped_shown: Dict[int, bool] = {}
 
 
 def start_session(user_id: int) -> SearchSession:
     session = SearchSession(user_id=user_id)
     _sessions[user_id] = session
+    clear_dropped_jobs(user_id)
     return session
 
 
@@ -53,3 +57,27 @@ def add_partial_job(user_id: int, job: JobInfo) -> None:
     existing = {j.source_url or f"{j.title}:{j.company}" for j in session.partial_jobs}
     if key not in existing:
         session.partial_jobs.append(job)
+
+
+def save_dropped_jobs(user_id: int, items: List[DroppedJob]) -> None:
+    _last_dropped[user_id] = list(items)
+    _dropped_shown[user_id] = False
+
+
+def get_dropped_jobs(user_id: int) -> List[DroppedJob]:
+    return list(_last_dropped.get(user_id, []))
+
+
+def mark_dropped_shown(user_id: int) -> bool:
+    """Возвращает True, если отброшенные ещё не отправлялись."""
+    if user_id not in _last_dropped:
+        return False
+    if _dropped_shown.get(user_id):
+        return False
+    _dropped_shown[user_id] = True
+    return True
+
+
+def clear_dropped_jobs(user_id: int) -> None:
+    _last_dropped.pop(user_id, None)
+    _dropped_shown.pop(user_id, None)

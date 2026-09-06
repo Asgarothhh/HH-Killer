@@ -15,7 +15,7 @@ from src.services.apify_service import (
     reset_session_runs,
     search_via_apify,
 )
-from src.services.job_filters import FilterReport, apply_search_filters
+from src.services.job_filters import DroppedJob, FilterReport, apply_search_filters, explain_drop
 from src.services.link_validator import BatchValidationResult, validate_user_links
 from src.services.search_query import (
     SearchFilters,
@@ -50,6 +50,7 @@ class SearchRunResult:
     collected: int = 0
     report: FilterReport = field(default_factory=FilterReport)
     dropped_by_score: int = 0
+    dropped: List[DroppedJob] = field(default_factory=list)
 
 
 def _is_cancelled(cancel_event: asyncio.Event | None) -> bool:
@@ -84,25 +85,41 @@ def _field_line(emoji: str, label: str, value: Optional[str]) -> Optional[str]:
     return f"{emoji} <b>{label}:</b> {h(text)}"
 
 
-def format_job_card(job: JobInfo, index: int) -> str:
+def format_job_card(
+    job: JobInfo,
+    index: int,
+    *,
+    drop_note: Optional[str] = None,
+) -> str:
     """
     Карточка вакансии: строго поля JobExtraction + сводка ИИ-агента.
 
     Внутренние метрики (score, совпадения, пробелы) пользователю не показываются.
+    Если зарплата в вакансии не указана — это явно пишется в карточке.
     """
     data: JobExtraction = job.to_extraction()
 
     lines = [f"<b>{index}. {h(data.job_title)}</b>"]
+    if drop_note:
+        lines.append(f"<i>Почему скрыта: {h(drop_note)}</i>")
 
     for line in (
         _field_line("🏢", "Компания", data.company_name),
         _field_line("📍", "Локация", data.location),
         _field_line("💼", "Занятость", data.employment_type),
-        _field_line("💰", "Зарплата", data.salary_range),
-        _field_line("📅", "Опубликовано", data.posted_date),
     ):
         if line:
             lines.append(line)
+
+    salary = drop_placeholder(data.salary_range)
+    if salary:
+        lines.append(f"💰 <b>Зарплата:</b> {h(salary)}")
+    else:
+        lines.append("💰 <b>Зарплата:</b> не указана в вакансии")
+
+    posted = _field_line("📅", "Опубликовано", data.posted_date)
+    if posted:
+        lines.append(posted)
 
     description = (data.job_description or "").strip()
     if description:
@@ -224,13 +241,13 @@ async def run_multi_site_search(
     user_id: int | None = None,
     role_query: str | None = None,
 ) -> SearchRunResult:
-    """Ищет вакансии на нескольких сайтах строго в заданном регионе."""
+    """Ищет вакансии на нескольких сайтах строго в заданных регионах."""
     reset_session_runs()
     all_jobs: List[JobInfo] = []
     seen_keys: set[str] = set()
     cancelled = False
 
-    location = filters.location_for_url() if filters else "Polska"
+    locations = list(filters.locations_for_url()) if filters else ["Polska"]
     role_queries = (
         [role_query] if role_query
         else build_role_queries(user_job_preference, resume_profile)
@@ -238,7 +255,7 @@ async def run_multi_site_search(
     matching_context = build_matching_context(user_job_preference, filters)
 
     logger.info(apify_status_message())
-    logger.info("Регион поиска: %s · запросы: %s", location, role_queries)
+    logger.info("Регионы поиска: %s · запросы: %s", locations, role_queries)
 
     for index, url in enumerate(urls):
         if _is_cancelled(cancel_event):
@@ -257,32 +274,39 @@ async def run_multi_site_search(
                 "_total_sites": len(urls),
             })
 
-        jobs = await _search_single_site(
-            url=url,
-            user_job_preference=matching_context,
-            role_queries=role_queries,
-            max_jobs=max_jobs_per_site,
-            resume_profile=resume_profile,
-            input_mode=input_mode,
-            on_progress=on_progress,
-            filters=filters,
-            location=location,
-            cancel_event=cancel_event,
-            user_id=user_id,
-        )
+        for location in locations:
+            if _is_cancelled(cancel_event):
+                cancelled = True
+                break
 
-        for job in jobs:
-            key = job.source_url or f"{job.title}:{job.company}"
-            if key not in seen_keys:
-                seen_keys.add(key)
-                all_jobs.append(job)
+            jobs = await _search_single_site(
+                url=url,
+                user_job_preference=matching_context,
+                role_queries=role_queries,
+                max_jobs=max_jobs_per_site,
+                resume_profile=resume_profile,
+                input_mode=input_mode,
+                on_progress=on_progress,
+                filters=filters,
+                location=location,
+                cancel_event=cancel_event,
+                user_id=user_id,
+            )
+
+            for job in jobs:
+                key = job.source_url or f"{job.title}:{job.company}"
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    all_jobs.append(job)
 
     if _is_cancelled(cancel_event):
         cancelled = True
 
     if on_progress:
         await on_progress("filtering", {
-            "status_message": f"Проверяю регион «{location}» и фильтры…",
+            "status_message": (
+                f"Проверяю регион «{filters.region_label if filters else '—'}» и фильтры…"
+            ),
         })
 
     outcome = apply_search_filters(all_jobs, filters, resume_profile)
@@ -296,13 +320,28 @@ async def run_multi_site_search(
         outcome.jobs, matching_context, resume_profile, filters,
     )
     relevant = filter_relevant_jobs(scored)
+    relevant_keys = {job.source_url or f"{job.title}:{job.company}" for job in relevant}
 
+    dropped: List[DroppedJob] = list(outcome.dropped)
+    for job in scored:
+        key = job.source_url or f"{job.title}:{job.company}"
+        if key in relevant_keys:
+            continue
+        dropped.append(DroppedJob(
+            job=job,
+            reason="relevance",
+            detail=explain_drop("relevance", job, filters),
+        ))
+        outcome.report.drop("relevance")
+
+    limit = max_jobs_per_site * max(len(urls), 1) * max(len(locations), 1)
     return SearchRunResult(
-        jobs=relevant[: max_jobs_per_site * max(len(urls), 1)],
+        jobs=relevant[:limit],
         cancelled=cancelled,
         collected=len(all_jobs),
         report=outcome.report,
         dropped_by_score=len(scored) - len(relevant),
+        dropped=dropped,
     )
 
 

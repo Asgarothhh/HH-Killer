@@ -25,7 +25,15 @@ from src.bot.keyboards import (
     sites_kb,
 )
 from src.bot.progress import SearchProgressTracker
-from src.bot.search_session import cancel_session, end_session, get_session, start_session
+from src.bot.search_session import (
+    cancel_session,
+    end_session,
+    get_dropped_jobs,
+    get_session,
+    mark_dropped_shown,
+    save_dropped_jobs,
+    start_session,
+)
 from src.bot.states import InputMode, SearchStates
 from src.models.models import JobInfo, ResumeProfile
 from src.services.job_filters import FilterReport
@@ -44,6 +52,7 @@ from src.services.search_query import (
     parse_salary,
 )
 from src.utils.logger import get_logger
+from src.utils.location_utils import MAX_REGIONS, merge_regions, parse_region_list, toggle_region
 from src.utils.telegram_html import (
     download_document_bytes,
     h,
@@ -56,13 +65,43 @@ logger = get_logger(__name__)
 
 MAX_JOBS_PER_SITE = 5
 MAX_CARDS = 10
+MAX_DROPPED_CARDS = 10
+
+
+def _ru_jobs(count: int) -> str:
+    n = abs(count) % 100
+    if 11 <= n <= 14:
+        word = "вакансий"
+    else:
+        last = n % 10
+        word = "вакансия" if last == 1 else "вакансии" if 2 <= last <= 4 else "вакансий"
+    return f"{count} {word}"
+
+
+def _ru_shown_line(shown: int, total: int) -> str:
+    one = shown % 10 == 1 and shown % 100 != 11
+    if shown == total:
+        verb = "Просмотрена" if one else "Просмотрено"
+        return f"{verb} {_ru_jobs(total)} — все прошли фильтры."
+    verb = "Показана" if one else "Показано"
+    return f"{verb} {_ru_jobs(shown)} из {total}."
 
 
 # ── Состояние поиска в FSM ─────────────────────────────────────────────
 
+def _regions_from_data(data: dict) -> List[str]:
+    stored = data.get("search_regions")
+    if stored:
+        return list(merge_regions(stored))
+    single = data.get("search_region")
+    if single:
+        return list(parse_region_list(str(single)))
+    return []
+
+
 def _filters_from_data(data: dict) -> SearchFilters:
     return SearchFilters(
-        region=data.get("search_region"),
+        regions=tuple(_regions_from_data(data)),
         work_format=data.get("search_format", "any"),
         employment_types=tuple(data.get("search_employment", ())),
         salary_min=data.get("search_salary_min"),
@@ -93,8 +132,8 @@ def _setup_text(data: dict, filters: SearchFilters, urls: List[str]) -> str:
         extra = f" и ещё {len(urls) - 6}" if len(urls) > 6 else ""
         lines += ["", f"<b>Сайты:</b> {h(names)}{extra}"]
 
-    if not filters.region:
-        lines += ["", "⚠️ <b>Укажите регион</b> — поиск идёт строго по нему."]
+    if not filters.has_region:
+        lines += ["", "⚠️ <b>Укажите регион</b> — можно несколько городов, поиск идёт строго по ним."]
     elif not urls:
         lines += ["", "⚠️ Выберите хотя бы один сайт."]
     else:
@@ -125,7 +164,7 @@ async def _show_setup(
     data = await state.get_data()
     filters = _filters_from_data(data)
     urls: List[str] = list(data.get("urls", []))
-    ready = bool(filters.region and urls and data.get("user_job_preference"))
+    ready = bool(filters.has_region and urls and data.get("user_job_preference"))
 
     text = _setup_text(data, filters, urls)
     markup = setup_kb(filters, len(urls), ready)
@@ -153,7 +192,7 @@ async def _return_to_setup(message: Message, state: FSMContext, bot: Bot) -> Non
     if setup_id:
         filters = _filters_from_data(data)
         urls: List[str] = list(data.get("urls", []))
-        ready = bool(filters.region and urls and data.get("user_job_preference"))
+        ready = bool(filters.has_region and urls and data.get("user_job_preference"))
         try:
             await bot.edit_message_text(
                 chat_id=message.chat.id,
@@ -235,8 +274,8 @@ async def receive_resume(message: Message, state: FSMContext, bot: Bot) -> None:
         updates["search_experience_years"] = profile.experience_years
 
     data = await state.get_data()
-    if profile.location and not data.get("search_region"):
-        updates["search_region"] = profile.location
+    if profile.location and not _regions_from_data(data):
+        updates["search_regions"] = list(parse_region_list(profile.location))
 
     await state.update_data(**updates)
     await _apply_default_sites(state)
@@ -290,51 +329,104 @@ async def cb_setup_query(callback: CallbackQuery, state: FSMContext) -> None:
 
 # ── Регион ─────────────────────────────────────────────────────────────
 
-@router.callback_query(F.data == "set:region")
-async def cb_set_region(callback: CallbackQuery, state: FSMContext) -> None:
+def _region_screen_text(selected: List[str]) -> str:
+    if selected:
+        listed = ", ".join(selected)
+        return (
+            "<b>📍 Регионы поиска</b>\n\n"
+            f"Выбрано: <b>{h(listed)}</b>\n"
+            f"Можно до {MAX_REGIONS} городов. Вакансия проходит, если она "
+            "хотя бы в одном из них.\n\n"
+            "Нажмите город ещё раз, чтобы убрать его."
+        )
+    return (
+        "<b>📍 Регионы поиска</b>\n\n"
+        "Выберите один или несколько городов. "
+        "Можно ввести списком: <i>Брест, Минск и Москва</i>."
+    )
+
+
+async def _show_region_screen(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
+    selected = _regions_from_data(data)
     resume = (data.get("resume_profile") or {}).get("location")
     await _edit(
         callback,
-        "<b>📍 Регион поиска</b>\n\n"
-        "Вакансии из других мест в результаты не попадут.\n"
-        "Для удалённой работы выберите «Вся Польша» и формат «Удалённо».",
-        reply_markup=region_kb(resume),
+        _region_screen_text(selected),
+        reply_markup=region_kb(selected, resume),
         parse_mode="HTML",
     )
+
+
+@router.callback_query(F.data == "set:region")
+async def cb_set_region(callback: CallbackQuery, state: FSMContext) -> None:
+    await _show_region_screen(callback, state)
     await safe_callback_answer(callback)
 
 
 @router.callback_query(F.data.startswith("region:"))
 async def cb_pick_region(callback: CallbackQuery, state: FSMContext) -> None:
     value = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    selected = _regions_from_data(data)
 
     if value == "__custom__":
         await _prompt(
             callback,
-            "<b>📍 Введите город или страну</b>\n\n"
-            "Например: <i>Rzeszów</i>, <i>Mazowieckie</i>, <i>Berlin</i>, <i>Polska</i>",
+            "<b>📍 Введите города</b>\n\n"
+            "Один или несколько через запятую, например:\n"
+            "<i>Брест, Минск и Москва</i>\n"
+            f"Максимум {MAX_REGIONS}.",
             state,
             SearchStates.waiting_region,
         )
         return
 
-    if value == "__resume__":
-        data = await state.get_data()
-        value = (data.get("resume_profile") or {}).get("location") or "Polska"
+    if value == "__clear__":
+        await state.update_data(search_regions=[], search_region=None)
+        await _show_region_screen(callback, state)
+        await safe_callback_answer(callback, "Регионы сброшены")
+        return
 
-    await state.update_data(search_region=value)
-    await _show_setup(callback.message, state)
-    await safe_callback_answer(callback, f"📍 {value}")
+    if value == "__resume__":
+        resume = (data.get("resume_profile") or {}).get("location") or ""
+        added = parse_region_list(resume)
+        if not added:
+            await safe_callback_answer(callback, "В резюме нет города", show_alert=True)
+            return
+        merged = merge_regions(selected, added)
+        await state.update_data(search_regions=list(merged), search_region=None)
+        await _show_region_screen(callback, state)
+        await safe_callback_answer(callback, f"📍 {', '.join(merged)}")
+        return
+
+    before = tuple(selected)
+    updated = toggle_region(selected, value)
+    if updated == before and len(before) >= MAX_REGIONS:
+        await safe_callback_answer(
+            callback,
+            f"Можно выбрать не больше {MAX_REGIONS} регионов",
+            show_alert=True,
+        )
+        return
+
+    await state.update_data(search_regions=list(updated), search_region=None)
+    await _show_region_screen(callback, state)
+    await safe_callback_answer(callback, f"📍 {', '.join(updated) if updated else 'не задан'}")
 
 
 @router.message(SearchStates.waiting_region, F.text)
 async def receive_region(message: Message, state: FSMContext, bot: Bot) -> None:
-    region = message.text.strip()
-    if len(region) < 2:
-        await message.answer("Введите название города или страны (мин. 2 символа).")
+    added = parse_region_list(message.text)
+    if not added:
+        await message.answer(
+            "Не разобрал города. Напишите, например: <i>Брест, Минск, Москва</i>",
+            parse_mode="HTML",
+        )
         return
-    await state.update_data(search_region=region)
+    data = await state.get_data()
+    merged = merge_regions(_regions_from_data(data), added)
+    await state.update_data(search_regions=list(merged), search_region=None)
     await _return_to_setup(message, state, bot)
 
 
@@ -625,6 +717,55 @@ async def cancel_active_search(callback: CallbackQuery, state: FSMContext) -> No
         await safe_callback_answer(callback, "Активного поиска нет", show_alert=True)
 
 
+@router.callback_query(F.data == "search:dropped")
+async def cb_show_dropped(callback: CallbackQuery, bot: Bot) -> None:
+    user_id = callback.from_user.id
+    dropped = get_dropped_jobs(user_id)
+    if not dropped:
+        await safe_callback_answer(
+            callback,
+            "Список отброшенных уже недоступен — запустите поиск ещё раз",
+            show_alert=True,
+        )
+        return
+    if not mark_dropped_shown(user_id):
+        await safe_callback_answer(callback, "Отброшенные вакансии уже отправлены выше")
+        return
+
+    await safe_callback_answer(callback, f"Отправляю {_ru_jobs(len(dropped))}")
+
+    chat = callback.message.chat if callback.message else None
+    if chat is None:
+        return
+
+    header = (
+        f"<b>👁 Отброшенные вакансии</b> — {_ru_jobs(len(dropped))}\n"
+        "Это объявления, которые не прошли выбранные фильтры. "
+        "По каждой указано, почему её скрыли."
+    )
+    await bot.send_message(chat.id, header, parse_mode="HTML")
+
+    to_send = dropped[:MAX_DROPPED_CARDS]
+    for index, item in enumerate(to_send, 1):
+        try:
+            await bot.send_message(
+                chat.id,
+                format_job_card(item.job, index, drop_note=item.explanation),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception as error:
+            logger.warning("Не удалось отправить отброшенную карточку %d: %s", index, error)
+        await asyncio.sleep(0.3)
+
+    leftover = len(dropped) - len(to_send)
+    if leftover:
+        await bot.send_message(
+            chat.id,
+            f"… и ещё {_ru_jobs(leftover)} не показаны, чтобы не заспамить чат.",
+        )
+
+
 @router.callback_query(F.data == "search:start")
 async def cb_start_search(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
@@ -635,7 +776,7 @@ async def cb_start_search(callback: CallbackQuery, state: FSMContext, bot: Bot) 
     if not preference:
         await safe_callback_answer(callback, "Сначала опишите вакансию или пришлите резюме", show_alert=True)
         return
-    if not filters.region:
+    if not filters.has_region:
         await safe_callback_answer(callback, "Укажите регион поиска", show_alert=True)
         return
     if not urls:
@@ -681,11 +822,11 @@ async def cb_start_search(callback: CallbackQuery, state: FSMContext, bot: Bot) 
     session = start_session(user_id)
 
     tracker = SearchProgressTracker(
-        total_sites=len(valid_urls),
-        max_jobs_target=MAX_JOBS_PER_SITE * len(valid_urls),
+        total_sites=len(valid_urls) * max(1, len(filters.region_values)),
+        max_jobs_target=MAX_JOBS_PER_SITE * len(valid_urls) * max(1, len(filters.region_values)),
         region=filters.region_label,
         filters_line=filters.summary_line(),
-        max_steps=MAX_JOBS_PER_SITE * 8,
+        max_steps=MAX_JOBS_PER_SITE * 8 * max(1, len(filters.region_values)),
     )
     tracker.status_message = "Ссылки проверены"
 
@@ -754,6 +895,7 @@ async def cb_start_search(callback: CallbackQuery, state: FSMContext, bot: Bot) 
 
     await _deliver_results(
         bot, callback.message.chat.id, progress_msg, result, filters,
+        callback.from_user.id,
     )
     await state.set_state(SearchStates.setup)
 
@@ -761,30 +903,38 @@ async def cb_start_search(callback: CallbackQuery, state: FSMContext, bot: Bot) 
 def _results_header(result, filters: SearchFilters) -> str:
     count = len(result.jobs)
     report: FilterReport = result.report
+    collected = result.collected or report.total
+    dropped_count = len(getattr(result, "dropped", None) or [])
 
-    if count:
+    if result.cancelled:
         title = (
-            f"⏹ <b>Поиск остановлен</b> — {count} вакансий"
-            if result.cancelled
-            else f"✅ <b>Найдено {count} вакансий</b> в {h(filters.region_label)}"
+            f"⏹ <b>Поиск остановлен</b> — показана {_ru_jobs(count)}"
+            if count
+            else "⏹ <b>Поиск остановлен</b> — подходящих вакансий пока нет"
         )
+    elif count:
+        title = f"✅ <b>Найдено {_ru_jobs(count)}</b> в {h(filters.region_label)}"
     else:
-        title = (
-            "⏹ <b>Поиск остановлен</b> — подходящих вакансий пока нет"
-            if result.cancelled
-            else f"😔 <b>В {h(filters.region_label)} ничего не подошло</b>"
-        )
+        title = f"😔 <b>В {h(filters.region_label)} ничего не подошло</b>"
 
     lines = [title]
-    details = []
-    if report.total:
-        details.append(f"просмотрено {report.total}")
-    if report.dropped_total:
-        details.append(f"отброшено — {report.summary()}")
-    if result.dropped_by_score:
-        details.append(f"низкая релевантность: {result.dropped_by_score}")
-    if details:
-        lines.append(f"<i>{h('; '.join(details))}</i>")
+
+    if collected:
+        lines += ["", _ru_shown_line(count, collected)]
+
+    filter_line = filters.summary_line()
+    if filter_line:
+        lines.append(f"<i>{h(filter_line)}</i>")
+
+    reason_lines = report.reason_lines()
+    if reason_lines:
+        lines += ["", "<b>Не прошли фильтры:</b>"]
+        lines.extend(f"• {h(item)}" for item in reason_lines)
+        if dropped_count:
+            lines += [
+                "",
+                "Причины по каждой вакансии — кнопка «Показать отброшенные».",
+            ]
 
     if not count:
         lines += [
@@ -801,7 +951,11 @@ async def _deliver_results(
     progress_msg: Message,
     result,
     filters: SearchFilters,
+    user_id: int,
 ) -> None:
+    dropped = list(getattr(result, "dropped", None) or [])
+    save_dropped_jobs(user_id, dropped)
+
     await safe_edit_text(
         progress_msg, _results_header(result, filters), parse_mode="HTML",
     )
@@ -827,7 +981,7 @@ async def _deliver_results(
     await bot.send_message(
         chat_id,
         f"{tail}Что дальше?",
-        reply_markup=after_search_kb(),
+        reply_markup=after_search_kb(len(dropped)),
     )
 
 
