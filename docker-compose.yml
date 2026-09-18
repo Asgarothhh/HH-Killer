@@ -1,8 +1,4 @@
 name: hh-killer
-networks:
-  default:
-    name: bridge
-    external: true
 
 services:
   bot:
@@ -23,6 +19,9 @@ services:
       - no-new-privileges:true
     mem_limit: 2g
     oom_score_adj: 200
+    # docker0 без alias: встроенный bridge их не поддерживает, user-defined сеть
+    # compose создаёт/сносит и из‑за iptables может отвалить AmneziaWG.
+    network_mode: bridge
     volumes:
       - ./logs:/app/logs
       - ./storage:/app/storage:ro
