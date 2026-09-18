@@ -17,7 +17,6 @@ services:
     shm_size: "1gb"
     mem_limit: 2g
     oom_score_adj: 200
-    user: "1000:1000"
     # docker0: без своей compose-сети, чтобы up/down не трогал iptables/AmneziaWG.
     network_mode: bridge
     volumes:

@@ -16,11 +16,13 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
-RUN mkdir -p /app/logs /app/storage \
+RUN chmod 755 /usr/local/bin/docker-entrypoint.sh \
+    && mkdir -p /app/logs /app/storage \
     && (id pwuser >/dev/null 2>&1 || useradd --create-home --uid 1000 --shell /bin/bash pwuser) \
     && chown -R pwuser /app
 
-USER pwuser
-
+# Root only for entrypoint (chown bind-mounted ./logs), then drop to uid 1000.
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["python", "run_bot.py"]

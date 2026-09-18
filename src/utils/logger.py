@@ -26,11 +26,18 @@ def setup_applevel_logger(logger_name=APP_LOGGER_NAME, file_name=None):
 
     if file_name:
         log_path = Path(file_name)
-        if log_path.parent and str(log_path.parent) not in ("", "."):
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-        fh = logging.FileHandler(log_path, encoding="utf-8")
-        fh.setFormatter(formatter)
-        logger.addHandler(fh)
+        try:
+            if log_path.parent and str(log_path.parent) not in ("", "."):
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+            fh = logging.FileHandler(log_path, encoding="utf-8")
+            fh.setFormatter(formatter)
+            logger.addHandler(fh)
+        except OSError as exc:
+            logger.warning(
+                "Не удалось открыть лог-файл %s: %s — только stdout",
+                log_path,
+                exc,
+            )
 
     return logger
 

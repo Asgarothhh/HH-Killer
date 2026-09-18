@@ -116,11 +116,7 @@ docker compose up -d --build
 docker compose logs -f bot
 ```
 
-Права на `logs/`: процесс в контейнере идёт от `pwuser` (обычно uid 1000). Если файл лога не создаётся:
-
-```bash
-sudo chown -R 1000:1000 logs
-```
+Права на `logs/`: entrypoint при старте делает `chown 1000:1000` на том. Если лог всё равно недоступен, бот пишет только в stdout (`docker compose logs`).
 
 Остановка только бота: `docker compose down`. Это не трогает чужие контейнеры (например AmneziaWG). Не используйте `--remove-orphans` и не перезапускайте `docker.service` ради бота — из‑за iptables может отвалиться VPN.
 
@@ -240,7 +236,7 @@ docker compose up -d --build
 | Chrome channel недоступен | В Docker это нормально: compose ставит `PLAYWRIGHT_USE_CHROME=false`. Локально установите Chrome или тоже выставьте `false` |
 | `exec …: operation not permitted` (python/tini/docker-init) | Docker из snap + `no-new-privileges`. В актуальном compose этого флага нет. Перезапустите: `docker compose up -d --no-deps bot`. Навсегда: `snap remove docker` и установка с get.docker.com |
 | Chromium падает, `page crashed` | Мало `/dev/shm`: в compose уже `shm_size: 1gb`. Не хватает RAM — держите `SEARCH_MAX_CONCURRENT=1` |
-| Permission denied на `bot.log` | `chown 1000:1000 logs` |
+| Permission denied на `bot.log` | Пересоберите образ с entrypoint: `docker compose up -d --build --no-deps bot`. Либо `chown 1000:1000 logs` |
 | Пустая выдача / блокировки | Прокси, Apify, cookies; смотрите `docker compose logs` |
 | Apify «лимит исчерпан» | Счётчик на **жизнь процесса**, не на один поиск. Рестарт контейнера сбрасывает. Либо поднимите `APIFY_MAX_RUNS_PER_SESSION` / `APIFY_MAX_RUNS_PER_DAY` |
 | После рестарта пропал экран настройки | Ожидаемо: MemoryStorage |
