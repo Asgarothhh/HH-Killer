@@ -1,3 +1,4 @@
+# Playwright Python image: browsers match the pinned playwright version in requirements.txt
 FROM mcr.microsoft.com/playwright/python:v1.62.0-noble
 
 USER root
@@ -22,6 +23,4 @@ RUN mkdir -p /app/logs /app/storage \
 
 USER pwuser
 
-# No tini/docker-init: those binaries are setuid/caps and execve fails with
-# no-new-privileges (EPERM). Python is PID 1; cgroup reaps children on stop.
 CMD ["python", "run_bot.py"]

@@ -212,7 +212,8 @@ docker compose up -d --build
 - Firewall: входящие только SSH
 - Секреты только в `.env` с правами `600`, не в Dockerfile и не в git
 - Docker без `--privileged` и без проброса `/var/run/docker.sock`
-- `security_opt: no-new-privileges` уже в `docker-compose.yml`
+- Контейнер от uid 1000, без публикации портов, лимит памяти 2 GB
+- `no-new-privileges` **не** ставим: на Docker из snap (AppArmor) это даёт `exec …: operation not permitted` на любом бинарнике. Ставьте Docker с https://get.docker.com, не `snap install docker`
 - Whitelist — основной контроль: знание username бота недостаточно
 - Прокси-URL с логином/паролем — тоже секрет
 
@@ -237,7 +238,7 @@ docker compose up -d --build
 | Бот молчит / «Нет доступа» | `/whoami` у уже добавленного пользователя или ID из ответа; перезапуск после правки `.env` |
 | `OPENROUTER_API_KEY` 401 | Новый ключ на openrouter.ai, без кавычек и пробелов |
 | Chrome channel недоступен | В Docker это нормально: compose ставит `PLAYWRIGHT_USE_CHROME=false`. Локально установите Chrome или тоже выставьте `false` |
-| `exec …/tini` или `…/docker-init: operation not permitted` | `no-new-privileges` + setuid/caps у init. В актуальном compose `init: false`, в образе нет tini. Пересоберите: `docker compose up -d --build` |
+| `exec …: operation not permitted` (python/tini/docker-init) | Docker из snap + `no-new-privileges`. В актуальном compose этого флага нет. Перезапустите: `docker compose up -d --no-deps bot`. Навсегда: `snap remove docker` и установка с get.docker.com |
 | Chromium падает, `page crashed` | Мало `/dev/shm`: в compose уже `shm_size: 1gb`. Не хватает RAM — держите `SEARCH_MAX_CONCURRENT=1` |
 | Permission denied на `bot.log` | `chown 1000:1000 logs` |
 | Пустая выдача / блокировки | Прокси, Apify, cookies; смотрите `docker compose logs` |
