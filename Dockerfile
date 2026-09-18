@@ -1,4 +1,3 @@
-# Playwright Python image: browsers match the pinned playwright version in requirements.txt
 FROM mcr.microsoft.com/playwright/python:v1.62.0-noble
 
 USER root
@@ -12,6 +11,11 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tini \
+    && chmod 0755 /usr/bin/tini \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -23,4 +27,5 @@ RUN mkdir -p /app/logs /app/storage \
 
 USER pwuser
 
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python", "run_bot.py"]

@@ -1,6 +1,14 @@
+name: hh-killer
+networks:
+  default:
+    name: bridge
+    external: true
+
 services:
   bot:
-    build: .
+    build:
+      context: .
+    image: hh-killer-bot
     container_name: hh-killer-bot
     env_file:
       - .env
@@ -9,10 +17,12 @@ services:
       PLAYWRIGHT_USE_CHROME: "false"
       LOG_FILE: /app/logs/bot.log
     restart: unless-stopped
-    init: true
+    init: false
     shm_size: "1gb"
     security_opt:
       - no-new-privileges:true
+    mem_limit: 2g
+    oom_score_adj: 200
     volumes:
       - ./logs:/app/logs
       - ./storage:/app/storage:ro
