@@ -49,6 +49,18 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     await message.answer(WELCOME, reply_markup=main_menu_kb(), parse_mode="HTML")
 
 
+@router.message(Command("whoami"))
+async def cmd_whoami(message: Message) -> None:
+    user = message.from_user
+    if not user:
+        return
+    username = f"@{user.username}" if user.username else "—"
+    await message.answer(
+        f"Ваш Telegram ID: <code>{user.id}</code>\nUsername: {username}",
+        parse_mode="HTML",
+    )
+
+
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     await message.answer(HELP_TEXT, reply_markup=help_kb(), parse_mode="HTML")

@@ -1,11 +1,13 @@
+.git
+.gitignore
 .env
 .env.*
 !.env.example
-__pycache__/
-*.py[cod]
 *.log
 logs/
 storage/
+__pycache__/
+*.py[cod]
 .venv/
 venv/
 .idea/
@@ -13,3 +15,5 @@ venv/
 *.egg-info/
 dist/
 build/
+.cursor/
+agent-transcripts/

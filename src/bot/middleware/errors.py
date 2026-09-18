@@ -6,7 +6,7 @@ from aiogram import Router
 from aiogram.types import CallbackQuery, ErrorEvent, Message
 
 from src.utils.logger import get_logger
-from src.utils.telegram_html import h, safe_callback_answer, safe_edit_text
+from src.utils.telegram_html import safe_callback_answer, safe_edit_text
 
 logger = get_logger(__name__)
 
@@ -26,7 +26,6 @@ async def global_error_handler(event: ErrorEvent) -> bool:
     update = event.update
     user_message = (
         "⚠️ <b>Произошла ошибка</b>\n\n"
-        f"{h(str(exc)[:500])}\n\n"
         "Попробуйте /start или обратитесь к администратору."
     )
 

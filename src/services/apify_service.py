@@ -1,7 +1,7 @@
 """Интеграция с Apify для сложных job-сайтов (LinkedIn, Indeed).
 
 Оптимизировано под бесплатный план Apify (~$5/мес):
-- жёсткий лимит результатов и запусков за сессию;
+- жёсткий лимит результатов и запусков на жизнь процесса (и опционально на сутки);
 - Apify только для LinkedIn/Indeed (Playwright для остальных);
 - fallback на Playwright, если квота исчерпана.
 """
@@ -12,7 +12,7 @@ import asyncio
 import inspect
 import os
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -29,12 +29,15 @@ DEFAULT_INDEED_ACTOR = "misceres/indeed-scraper"
 DEFAULT_WEB_SCRAPER = "apify/web-scraper"
 
 _session_runs = 0
+_day_runs = 0
+_day_key = ""
 
 
 @dataclass
 class ApifyLimits:
     max_results_per_run: int
     max_runs_per_session: int
+    max_runs_per_day: int
     fallback_to_playwright: bool
 
 
@@ -43,8 +46,18 @@ def get_apify_limits() -> ApifyLimits:
     return ApifyLimits(
         max_results_per_run=int(os.getenv("APIFY_MAX_RESULTS", "10")),
         max_runs_per_session=int(os.getenv("APIFY_MAX_RUNS_PER_SESSION", "5")),
+        max_runs_per_day=int(os.getenv("APIFY_MAX_RUNS_PER_DAY", "0") or "0"),
         fallback_to_playwright=os.getenv("APIFY_FALLBACK_PLAYWRIGHT", "true").lower() == "true",
     )
+
+
+def _roll_daily_counter() -> None:
+    """Обнуляет суточный счётчик при смене UTC-даты."""
+    global _day_runs, _day_key
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _day_key != today:
+        _day_key = today
+        _day_runs = 0
 
 
 def is_apify_available() -> bool:
@@ -63,24 +76,32 @@ def _actor_id(env_key: str, default: str) -> str:
 
 
 def can_run_apify() -> tuple[bool, str]:
-    """Проверяет, можно ли запустить ещё один Apify run в этой сессии."""
+    """Проверяет, можно ли запустить ещё один Apify run (бюджет процесса / суток)."""
     global _session_runs
 
     if not is_apify_available():
         return False, "APIFY_API_TOKEN не задан — используется Playwright"
 
+    _roll_daily_counter()
     limits = get_apify_limits()
     if _session_runs >= limits.max_runs_per_session:
         return False, (
-            f"Лимит Apify ({limits.max_runs_per_session} запусков/сессию) исчерпан. "
+            f"Лимит Apify ({limits.max_runs_per_session} запусков на процесс) исчерпан. "
+            "Playwright fallback."
+        )
+    if limits.max_runs_per_day and _day_runs >= limits.max_runs_per_day:
+        return False, (
+            f"Дневной лимит Apify ({limits.max_runs_per_day} запусков/сутки UTC) исчерпан. "
             "Playwright fallback."
         )
     return True, "OK"
 
 
 def reset_session_runs() -> None:
-    global _session_runs
+    """Сбрасывает бюджет процесса. Не вызывать перед каждым поиском."""
+    global _session_runs, _day_runs
     _session_runs = 0
+    _day_runs = 0
 
 
 def _extract_field(item: dict, *keys: str, default: str = "") -> str:
@@ -217,7 +238,7 @@ async def _run_actor(
     memory_mbytes: Optional[int] = None,
 ) -> List[dict]:
     """Запускает Apify Actor и возвращает items из dataset."""
-    global _session_runs
+    global _session_runs, _day_runs
 
     token = get_apify_token()
     if not token:
@@ -245,7 +266,11 @@ async def _run_actor(
     try:
         items = await asyncio.to_thread(_sync_run)
         _session_runs += 1
-        logger.info("Apify вернул %d items (run %d)", len(items), _session_runs)
+        _day_runs += 1
+        logger.info(
+            "Apify вернул %d items (run %d процесса, %d за сутки)",
+            len(items), _session_runs, _day_runs,
+        )
         return items
     except Exception as error:
         logger.error("Apify ошибка (%s): %s", actor_id, error)
@@ -412,12 +437,17 @@ async def search_via_apify(
 
 
 def apify_status_message() -> str:
-    """Краткий статус Apify для пользователя."""
+    """Краткий статус Apify для логов."""
     if not is_apify_available():
         return "Apify: не настроен (только Playwright)"
+    _roll_daily_counter()
     limits = get_apify_limits()
     remaining = max(0, limits.max_runs_per_session - _session_runs)
-    return (
-        f"Apify: ✅ (free plan, до {limits.max_results_per_run} вак./run, "
-        f"осталось {remaining} запусков)"
-    )
+    parts = [
+        f"Apify: ✅ (до {limits.max_results_per_run} вак./run, "
+        f"осталось {remaining} запусков процесса)"
+    ]
+    if limits.max_runs_per_day:
+        day_left = max(0, limits.max_runs_per_day - _day_runs)
+        parts.append(f"сутки: {day_left}/{limits.max_runs_per_day}")
+    return ", ".join(parts)

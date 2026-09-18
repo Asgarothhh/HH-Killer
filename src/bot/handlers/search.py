@@ -31,8 +31,10 @@ from src.bot.search_session import (
     get_dropped_jobs,
     get_session,
     mark_dropped_shown,
+    release_search_slot,
     save_dropped_jobs,
     start_session,
+    try_acquire_search_slot,
 )
 from src.bot.states import InputMode, SearchStates
 from src.models.models import JobInfo, ResumeProfile
@@ -46,7 +48,6 @@ from src.services.resume_service import (
 from src.services.scraper_service import format_job_card, run_multi_site_search
 from src.services.search_query import (
     SearchFilters,
-    build_matching_context,
     build_role_queries,
     parse_experience,
     parse_salary,
@@ -783,6 +784,31 @@ async def cb_start_search(callback: CallbackQuery, state: FSMContext, bot: Bot) 
         await safe_callback_answer(callback, "Добавьте хотя бы один сайт", show_alert=True)
         return
 
+    if not await try_acquire_search_slot():
+        await safe_callback_answer(
+            callback,
+            "Сейчас идёт другой поиск. Подождите и нажмите ещё раз.",
+            show_alert=True,
+        )
+        return
+
+    try:
+        await _execute_search(
+            callback, state, bot, data, urls, preference, filters,
+        )
+    finally:
+        await release_search_slot()
+
+
+async def _execute_search(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+    data: dict,
+    urls: List[str],
+    preference: str,
+    filters: SearchFilters,
+) -> None:
     await safe_callback_answer(callback, "🚀 Начинаю")
     await state.set_state(SearchStates.searching)
 
@@ -817,7 +843,6 @@ async def cb_start_search(callback: CallbackQuery, state: FSMContext, bot: Bot) 
         except Exception as error:
             logger.warning("Не удалось восстановить профиль резюме: %s", error)
 
-    matching_context = build_matching_context(preference, filters)
     user_id = callback.from_user.id
     session = start_session(user_id)
 
@@ -882,7 +907,7 @@ async def cb_start_search(callback: CallbackQuery, state: FSMContext, bot: Bot) 
         end_session(user_id)
         await safe_edit_text(
             progress_msg,
-            f"❌ Поиск прервался: {h(str(error)[:300])}",
+            "❌ Поиск прервался из‑за внутренней ошибки. Попробуйте ещё раз.",
             reply_markup=after_search_kb(),
             parse_mode="HTML",
         )

@@ -1,8 +1,9 @@
-"""Активные поисковые сессии и отмена."""
+"""Активные поисковые сессии, отмена и слот одновременных поисков."""
 
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -24,6 +25,32 @@ class SearchSession:
 _sessions: Dict[int, SearchSession] = {}
 _last_dropped: Dict[int, List[DroppedJob]] = {}
 _dropped_shown: Dict[int, bool] = {}
+
+_search_lock = asyncio.Lock()
+_active_searches = 0
+
+
+def max_concurrent_searches() -> int:
+    try:
+        return max(1, int(os.getenv("SEARCH_MAX_CONCURRENT", "1")))
+    except ValueError:
+        return 1
+
+
+async def try_acquire_search_slot() -> bool:
+    """Занимает слот глобальной очереди поисков. False — все слоты заняты."""
+    global _active_searches
+    async with _search_lock:
+        if _active_searches >= max_concurrent_searches():
+            return False
+        _active_searches += 1
+        return True
+
+
+async def release_search_slot() -> None:
+    global _active_searches
+    async with _search_lock:
+        _active_searches = max(0, _active_searches - 1)
 
 
 def start_session(user_id: int) -> SearchSession:

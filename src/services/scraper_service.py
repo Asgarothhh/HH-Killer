@@ -12,7 +12,6 @@ from src.services.apify_service import (
     apify_status_message,
     can_run_apify,
     is_apify_available,
-    reset_session_runs,
     search_via_apify,
 )
 from src.services.job_filters import DroppedJob, FilterReport, apply_search_filters, explain_drop
@@ -242,7 +241,6 @@ async def run_multi_site_search(
     role_query: str | None = None,
 ) -> SearchRunResult:
     """Ищет вакансии на нескольких сайтах строго в заданных регионах."""
-    reset_session_runs()
     all_jobs: List[JobInfo] = []
     seen_keys: set[str] = set()
     cancelled = False

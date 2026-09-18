@@ -1,0 +1,19 @@
+services:
+  bot:
+    build: .
+    container_name: hh-killer-bot
+    env_file:
+      - .env
+    environment:
+      PLAYWRIGHT_HEADLESS: "true"
+      PLAYWRIGHT_USE_CHROME: "false"
+      LOG_FILE: /app/logs/bot.log
+    restart: unless-stopped
+    init: true
+    shm_size: "1gb"
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./logs:/app/logs
+      - ./storage:/app/storage:ro
+    # Порты не публикуем: бот сам ходит к Telegram API по HTTPS (long polling).
