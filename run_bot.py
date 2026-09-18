@@ -23,10 +23,17 @@ async def on_shutdown() -> None:
     logger.info("Бот остановлен")
 
 
+def _log_file_from_env() -> str | None:
+    """Пустой LOG_FILE или Docker без явного пути — только stdout."""
+    raw = os.getenv("LOG_FILE")
+    if raw is None:
+        return None if os.path.exists("/.dockerenv") else "bot.log"
+    return raw.strip() or None
+
+
 async def main() -> None:
     load_dotenv()
-    log_file = (os.getenv("LOG_FILE", "bot.log") or "").strip()
-    setup_applevel_logger(file_name=log_file or None)
+    setup_applevel_logger(file_name=_log_file_from_env())
     validate_environment()
 
     token = os.getenv("TELEGRAM_BOT_TOKEN")

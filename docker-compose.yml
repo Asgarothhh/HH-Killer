@@ -11,7 +11,7 @@ services:
     environment:
       PLAYWRIGHT_HEADLESS: "true"
       PLAYWRIGHT_USE_CHROME: "false"
-      LOG_FILE: /app/logs/bot.log
+      LOG_FILE: ""
     restart: unless-stopped
     init: false
     shm_size: "1gb"
@@ -20,6 +20,5 @@ services:
     # docker0: без своей compose-сети, чтобы up/down не трогал iptables/AmneziaWG.
     network_mode: bridge
     volumes:
-      - ./logs:/app/logs
       - ./storage:/app/storage:ro
     # Порты не публикуем: бот сам ходит к Telegram API по HTTPS (long polling).
