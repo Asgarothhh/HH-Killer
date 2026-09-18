@@ -11,11 +11,6 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends tini \
-    && chmod 0755 /usr/bin/tini \
-    && rm -rf /var/lib/apt/lists/*
-
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -27,5 +22,6 @@ RUN mkdir -p /app/logs /app/storage \
 
 USER pwuser
 
-ENTRYPOINT ["/usr/bin/tini", "--"]
+# No tini/docker-init: those binaries are setuid/caps and execve fails with
+# no-new-privileges (EPERM). Python is PID 1; cgroup reaps children on stop.
 CMD ["python", "run_bot.py"]

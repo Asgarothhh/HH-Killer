@@ -237,7 +237,7 @@ docker compose up -d --build
 | Бот молчит / «Нет доступа» | `/whoami` у уже добавленного пользователя или ID из ответа; перезапуск после правки `.env` |
 | `OPENROUTER_API_KEY` 401 | Новый ключ на openrouter.ai, без кавычек и пробелов |
 | Chrome channel недоступен | В Docker это нормально: compose ставит `PLAYWRIGHT_USE_CHROME=false`. Локально установите Chrome или тоже выставьте `false` |
-| `exec /sbin/docker-init: operation not permitted` | Docker `--init` + `no-new-privileges`. В актуальном compose `init: false`, tini внутри образа. Пересоберите: `docker compose up -d --build` |
+| `exec …/tini` или `…/docker-init: operation not permitted` | `no-new-privileges` + setuid/caps у init. В актуальном compose `init: false`, в образе нет tini. Пересоберите: `docker compose up -d --build` |
 | Chromium падает, `page crashed` | Мало `/dev/shm`: в compose уже `shm_size: 1gb`. Не хватает RAM — держите `SEARCH_MAX_CONCURRENT=1` |
 | Permission denied на `bot.log` | `chown 1000:1000 logs` |
 | Пустая выдача / блокировки | Прокси, Apify, cookies; смотрите `docker compose logs` |
